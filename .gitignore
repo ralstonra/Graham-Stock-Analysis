@@ -1,0 +1,15 @@
+ 
+# Logs and caches
+nyse_graham_screen.log
+api_cache.db
+*.pkl
+*.pyc
+
+# Sensitive data
+stock_favorites.json
+__pycache__/
+*.db-journal
+
+# IDE-specific files
+.vscode/
+.idea/
