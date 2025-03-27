@@ -1,27 +1,25 @@
-import asyncio
-import logging
-from graham_data import fetch_historical_data  # Adjust import based on your file structure
-import os
+import yfinance as yf
 
-# Configure logging (similar to os.py)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('nyse_graham_screen.log', mode='w'),  # Overwrite log file
-        logging.StreamHandler()  # Also print to console
-    ]
-)
-
-# Global set to prevent duplicate fetches
-FETCHED_TICKERS = set()
-
-async def run_test():
-    ticker = "F"
-    exchange = "Stock"
-    roe_10y, rotc_10y, eps_10y, div_10y, years = await fetch_historical_data(ticker, exchange)
-    logging.info(f"Test results for {ticker}: ROE={roe_10y[:5]}..., ROIC={rotc_10y[:5]}..., EPS={eps_10y[:5]}..., Dividends={div_10y[:5]}..., Years={years}")
-    print(f"Test results for {ticker}: ROE={roe_10y[:5]}..., ROIC={rotc_10y[:5]}..., EPS={eps_10y[:5]}..., Dividends={div_10y[:5]}..., Years={years}")
+def get_treasury_yield():
+    """
+    Fetches the most recent 10-year Treasury yield from Yahoo Finance.
+    
+    Returns:
+        float: The 10-year Treasury yield in percentage terms.
+    
+    Raises:
+        ValueError: If no data is available for the ticker '^TNX'.
+    """
+    tnx = yf.Ticker("^TNX")
+    hist = tnx.history(period="1d")
+    if hist.empty:
+        raise ValueError("No data available for ^TNX")
+    yield_value = hist['Close'].iloc[-1]
+    return yield_value
 
 if __name__ == "__main__":
-    asyncio.run(run_test())
+    try:
+        yield_value = get_treasury_yield()
+        print(f"10-Year Treasury Yield: {yield_value:.2f}%")
+    except ValueError as e:
+        print(e)

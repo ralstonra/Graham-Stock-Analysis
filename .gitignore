@@ -13,3 +13,10 @@ __pycache__/
 # IDE-specific files
 .vscode/
 .idea/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Data directory (if you want to exclude raw data files)
+data/
