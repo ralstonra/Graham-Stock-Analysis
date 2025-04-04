@@ -5,6 +5,7 @@ import os
 import time
 import threading
 import hashlib
+import logging.handlers
 
 # Base directory
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -31,6 +32,18 @@ MAX_CALLS_PER_MINUTE_FREE = 5
 
 class FileHashError(Exception):
     pass
+
+# Logging setup with daily rotation
+log_file = os.path.join(DATA_DIR, 'nyse_graham_screen.log')
+handler = logging.handlers.TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7)  # Rotate daily, keep 7 backups
+handler.setLevel(logging.DEBUG)  # Capture all levels to file
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+
+logging.basicConfig(handlers=[handler], level=logging.INFO)  # Default to INFO for production
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)  # Console can show DEBUG for development
+logging.getLogger().addHandler(console)
 
 def get_file_hash(file_path: str) -> str:
     try:

@@ -32,6 +32,7 @@ if not logger.handlers:
     logger.addHandler(console)
 
 FAVORITES_LOCK = threading.Lock()
+DATA_DIR = BASE_DIR  # Assuming DATA_DIR is the same as BASE_DIR; adjust if necessary
 
 class GrahamScreeningApp:
     def __init__(self, root):
@@ -521,6 +522,21 @@ class GrahamScreeningApp:
         return "Unknown"
 
     async def analyze_multiple_stocks_async(self, tickers):
+        # Exclude invalid tickers from analysis
+        nyse_invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
+        nasdaq_invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
+        invalid_tickers = set()
+        for invalid_file in [nyse_invalid_file, nasdaq_invalid_file]:
+            if os.path.exists(invalid_file):
+                with open(invalid_file, 'r') as f:
+                    invalid_tickers.update(f.read().splitlines())
+        valid_tickers = [t for t in tickers if t not in invalid_tickers]
+        if len(valid_tickers) < len(tickers):
+            excluded = set(tickers) - set(valid_tickers)
+            logging.info(f"Excluded {len(excluded)} invalid tickers: {excluded}")
+            self.root.after(0, lambda: messagebox.showinfo("Excluded Tickers", f"Excluded {len(excluded)} invalid tickers: {', '.join(excluded)}"))
+        tickers = valid_tickers
+
         if not tickers:
             messagebox.showwarning("No Tickers", "No valid tickers to analyze.")
             return
