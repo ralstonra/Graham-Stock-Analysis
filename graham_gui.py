@@ -15,24 +15,16 @@ from graham_data import (screen_nasdaq_graham_stocks, screen_nyse_graham_stocks,
                          fetch_stock_data, get_stocks_connection, fetch_with_multiple_keys_async,
                          NYSE_LIST_FILE, NASDAQ_LIST_FILE, TickerManager, get_file_hash,
                          calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
-                         clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db)
-from config import BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, CACHE_EXPIRY
+                         clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db,
+                         get_sector_growth_rate, calculate_cagr)
+from config import BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, CACHE_EXPIRY, screening_logger, analyze_logger
 import queue
 import shutil
 import requests
 import ftplib
 
-# Logging setup
-logger = logging.getLogger()
-if not logger.handlers:
-    logging.basicConfig(filename=os.path.join(BASE_DIR, 'nyse_graham_screen.log'), level=logging.DEBUG,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-    console = logging.StreamHandler()
-    console.setLevel(logging.DEBUG)
-    logger.addHandler(console)
-
 FAVORITES_LOCK = threading.Lock()
-DATA_DIR = BASE_DIR  # Assuming DATA_DIR is the same as BASE_DIR; adjust if necessary
+DATA_DIR = BASE_DIR
 
 class GrahamScreeningApp:
     def __init__(self, root):
@@ -40,6 +32,7 @@ class GrahamScreeningApp:
         self.root.title("Stock Analysis (Graham Defensive)")
         self.root.geometry("1200x900")
 
+        # Variables
         self.nyse_screen_var = tk.BooleanVar(value=False)
         self.nasdaq_screen_var = tk.BooleanVar(value=False)
         self.cancel_event = threading.Event()
@@ -51,15 +44,19 @@ class GrahamScreeningApp:
         self.ticker_cache = {}
         self.ticker_cache_lock = threading.Lock()
 
+        # Asyncio Thread Setup
         self.task_queue = queue.Queue()
         self.asyncio_thread = threading.Thread(target=self.run_asyncio_loop, args=(self.task_queue,), daemon=True)
         self.asyncio_thread.start()
 
+        # Main Frame Layout
         self.main_frame = ttk.Frame(root)
         self.main_frame.pack(expand=True, fill="both", padx=5, pady=5)
-        self.main_frame.grid_rowconfigure((0, 1), weight=1)
+        self.main_frame.grid_rowconfigure(0, weight=3)
+        self.main_frame.grid_rowconfigure(1, weight=1)
         self.main_frame.grid_columnconfigure((0, 1, 2), weight=1, minsize=400)
 
+        # Sub-Frames
         self.left_frame = ttk.Frame(self.main_frame, width=400)
         self.middle_frame = ttk.Frame(self.main_frame, width=400)
         self.right_frame = ttk.Frame(self.main_frame, width=400)
@@ -73,6 +70,7 @@ class GrahamScreeningApp:
         self.middle_frame.grid_columnconfigure(0, weight=1)
         self.right_frame.grid_columnconfigure(0, weight=1)
 
+        # Styling
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TLabel", font=("Helvetica", 9), background="#f0f0f0")
@@ -101,26 +99,24 @@ class GrahamScreeningApp:
         loop.close()
 
     def create_widgets(self):
-        ttk.Label(self.left_frame, text="Enter Stock Tickers (comma-separated, e.g., AOS, AAPL):").grid(row=0, column=0, pady=1, sticky="ew")
-        self.entry = ttk.Combobox(self.left_frame, width=50, values=list(self.ticker_manager.get_tickers("NYSE") | self.ticker_manager.get_tickers("NASDAQ")))
-        self.entry.grid(row=1, column=0, pady=1, sticky="ew")
+        # Left Frame Widgets (Analyze Stocks)
+        self.left_frame.grid_rowconfigure(tuple(range(15)), weight=1)
 
-        def validate_tickers(*args):
-            tickers = self.parse_tickers(self.entry.get())
-            return bool(tickers)
+        ttk.Label(self.left_frame, text="Enter Stock Tickers (comma-separated, e.g., AOS, AAPL):").grid(row=0, column=0, pady=2, sticky="ew")
+        self.entry = ttk.Entry(self.left_frame, width=50)
+        self.entry.grid(row=1, column=0, pady=2, sticky="ew")
+        self.entry.bind('<FocusOut>', lambda e: self.validate_tickers())
 
-        self.entry.bind('<FocusOut>', lambda e: validate_tickers())
-
-        ttk.Label(self.left_frame, text="Search Results:").grid(row=2, column=0, pady=1, sticky="ew")
+        ttk.Label(self.left_frame, text="Search Results:").grid(row=2, column=0, pady=2, sticky="ew")
         self.search_entry = ttk.Entry(self.left_frame, width=50)
-        self.search_entry.grid(row=3, column=0, pady=1, sticky="ew")
+        self.search_entry.grid(row=3, column=0, pady=2, sticky="ew")
         self.search_entry.bind('<KeyRelease>', self.filter_tree)
 
         self.favorites = self.load_favorites()
-        ttk.Label(self.left_frame, text="Favorite Lists:").grid(row=4, column=0, pady=1, sticky="ew")
+        ttk.Label(self.left_frame, text="Favorite Lists:").grid(row=4, column=0, pady=2, sticky="ew")
         self.favorite_var = tk.StringVar(value="Select Favorite")
         self.favorite_menu = ttk.Combobox(self.left_frame, textvariable=self.favorite_var, values=list(self.favorites.keys()))
-        self.favorite_menu.grid(row=5, column=0, pady=1, sticky="ew")
+        self.favorite_menu.grid(row=5, column=0, pady=2, sticky="ew")
 
         def load_favorite(event=None):
             selected = self.favorite_var.get()
@@ -132,7 +128,7 @@ class GrahamScreeningApp:
         self.favorite_menu.bind('<<ComboboxSelected>>', load_favorite)
 
         def save_favorite():
-            if not validate_tickers():
+            if not self.validate_tickers():
                 messagebox.showwarning("Invalid Tickers", "No valid tickers entered.")
                 return
             name = simpledialog.askstring("Save Favorite", "Enter list name:")
@@ -147,59 +143,62 @@ class GrahamScreeningApp:
                 self.favorite_menu['values'] = list(self.favorites.keys())
                 self.favorite_var.set(name)
 
-        ttk.Button(self.left_frame, text="Save Favorite", command=save_favorite).grid(row=6, column=0, pady=1, sticky="ew")
-        ttk.Button(self.left_frame, text="Manage Favorites", command=self.manage_favorites).grid(row=7, column=0, pady=1, sticky="ew")
+        ttk.Button(self.left_frame, text="Save Favorite", command=save_favorite).grid(row=6, column=0, pady=2, sticky="ew")
+        ttk.Button(self.left_frame, text="Manage Favorites", command=self.manage_favorites).grid(row=7, column=0, pady=2, sticky="ew")
 
-        ttk.Label(self.left_frame, text="Margin of Safety (%):").grid(row=8, column=0, pady=1, sticky="ew")
-        self.margin_of_safety_label = ttk.Label(self.left_frame, text="33%")
-        self.margin_of_safety_label.grid(row=9, column=0, pady=1, sticky="ew")
+        # Margin of Safety
+        self.margin_of_safety_label = ttk.Label(self.left_frame, text="Margin of Safety: 33%")
+        self.margin_of_safety_label.grid(row=8, column=0, pady=2, sticky="ew")
         ttk.Scale(self.left_frame, from_=0, to=50, orient=tk.HORIZONTAL, variable=self.margin_of_safety_var,
-                  command=lambda value: self.margin_of_safety_label.config(text=f"{int(float(value))}%")).grid(row=10, column=0, pady=1, sticky="ew")
+                  command=lambda value: self.margin_of_safety_label.config(text=f"Margin of Safety: {int(float(value))}%")).grid(row=9, column=0, pady=2, sticky="ew")
 
-        ttk.Label(self.left_frame, text="Expected Rate of Return (%):").grid(row=11, column=0, pady=1, sticky="ew")
-        self.expected_return_label = ttk.Label(self.left_frame, text="0%")
-        self.expected_return_label.grid(row=12, column=0, pady=1, sticky="ew")
+        # Expected Rate of Return
+        self.expected_return_label = ttk.Label(self.left_frame, text="Expected Rate of Return: 0%")
+        self.expected_return_label.grid(row=10, column=0, pady=2, sticky="ew")
         ttk.Scale(self.left_frame, from_=0, to=20, orient=tk.HORIZONTAL, variable=self.expected_return_var,
-                  command=lambda value: self.expected_return_label.config(text=f"{int(float(value))}%")).grid(row=13, column=0, pady=1, sticky="ew")
+                  command=lambda value: self.expected_return_label.config(text=f"Expected Rate of Return: {int(float(value))}%")).grid(row=11, column=0, pady=2, sticky="ew")
 
         self.analyze_button = ttk.Button(self.left_frame, text="Analyze Stocks", command=self.analyze_multiple_stocks)
-        self.analyze_button.grid(row=15, column=0, pady=1, sticky="ew")
-        ttk.Button(self.left_frame, text="Refresh Data", command=self.refresh_multiple_stocks).grid(row=16, column=0, pady=1, sticky="ew")
+        self.analyze_button.grid(row=14, column=0, pady=2, sticky="ew")
 
-        ttk.Checkbutton(self.middle_frame, text="Run NYSE Graham Screening", variable=self.nyse_screen_var).grid(row=0, column=0, pady=2, padx=2, sticky="w")
-        ttk.Button(self.middle_frame, text="Run NYSE Screening", command=self.run_nyse_screening).grid(row=1, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Cancel Screening", command=self.cancel_screening).grid(row=2, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Show NYSE Qualifying Stocks", command=self.display_nyse_qualifying_stocks).grid(row=3, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Export NYSE Qualifying Stocks", command=self.export_nyse_qualifying_stocks).grid(row=4, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Check Ticker File Ages", command=self.check_file_age).grid(row=5, column=0, pady=1, sticky="ew")
-        ttk.Button(self.middle_frame, text="Update Ticker Files", command=self.update_ticker_files).grid(row=6, column=0, pady=1, sticky="ew")
-
-        ttk.Checkbutton(self.right_frame, text="Run NASDAQ Graham Screening", variable=self.nasdaq_screen_var).grid(row=0, column=0, pady=2, padx=2, sticky="w")
-        ttk.Button(self.right_frame, text="Run NASDAQ Screening", command=self.run_nasdaq_screening).grid(row=1, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Cancel Screening", command=self.cancel_screening).grid(row=2, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Show NASDAQ Qualifying Stocks", command=self.display_nasdaq_qualifying_stocks).grid(row=3, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Export NASDAQ Qualifying Stocks", command=self.export_nasdaq_qualifying_stocks).grid(row=4, column=0, pady=2, sticky="ew")
+        # Middle Frame Widgets (Utility Buttons and Progress/Status)
+        ttk.Button(self.middle_frame, text="Check Ticker File Ages", command=self.check_file_age).grid(row=0, column=0, pady=2, sticky="ew")
+        ttk.Button(self.middle_frame, text="Update Ticker Files", command=self.update_ticker_files).grid(row=1, column=0, pady=2, sticky="ew")
+        ttk.Button(self.middle_frame, text="Clear Cache", command=self.clear_cache).grid(row=2, column=0, pady=2, sticky="ew")
+        ttk.Button(self.middle_frame, text="Help", command=self.show_help).grid(row=3, column=0, pady=2, sticky="ew")
+        ttk.Button(self.middle_frame, text="Cancel Screening", command=self.cancel_screening).grid(row=4, column=0, pady=2, sticky="ew")
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.middle_frame, variable=self.progress_var, maximum=100, length=300, mode='determinate')
-        self.progress_bar.grid(row=9, column=0, pady=2, sticky="ew")
+        self.progress_bar.grid(row=5, column=0, pady=2, sticky="ew")
         self.progress_label = ttk.Label(self.middle_frame, text="Progress: 0% (0/0 stocks processed, 0 passed)")
-        self.progress_label.grid(row=10, column=0, pady=1, sticky="ew")
+        self.progress_label.grid(row=6, column=0, pady=2, sticky="ew")
 
         self.cache_var = tk.DoubleVar()
         self.cache_bar = ttk.Progressbar(self.middle_frame, variable=self.cache_var, maximum=100, length=300, mode='determinate')
-        self.cache_bar.grid(row=11, column=0, pady=2, sticky="ew")
+        self.cache_bar.grid(row=7, column=0, pady=2, sticky="ew")
         self.cache_label = ttk.Label(self.middle_frame, text="Cache Usage: 0% (0 cached, 0 fresh)")
-        self.cache_label.grid(row=12, column=0, pady=1, sticky="ew")
+        self.cache_label.grid(row=8, column=0, pady=2, sticky="ew")
 
         self.rate_limit_label = ttk.Label(self.middle_frame, text="")
-        self.rate_limit_label.grid(row=13, column=0, pady=1, sticky="ew")
+        self.rate_limit_label.grid(row=9, column=0, pady=2, sticky="ew")
         self.status_label = ttk.Label(self.middle_frame, text="")
-        self.status_label.grid(row=14, column=0, pady=1, sticky="ew")
+        self.status_label.grid(row=10, column=0, pady=2, sticky="ew")
 
-        ttk.Button(self.middle_frame, text="Clear Cache", command=self.clear_cache).grid(row=15, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Help", command=self.show_help).grid(row=16, column=0, pady=2, sticky="ew")
+        # Right Frame Widgets (Screenings)
+        ttk.Checkbutton(self.right_frame, text="Run NYSE Graham Screening", variable=self.nyse_screen_var).grid(row=0, column=0, pady=2, padx=2, sticky="w")
+        ttk.Button(self.right_frame, text="Run NYSE Screening", command=self.run_nyse_screening).grid(row=1, column=0, pady=2, sticky="ew")
+        ttk.Button(self.right_frame, text="Show NYSE Qualifying Stocks", command=self.display_nyse_qualifying_stocks).grid(row=2, column=0, pady=2, sticky="ew")
+        ttk.Button(self.right_frame, text="Export NYSE Qualifying Stocks", command=self.export_nyse_qualifying_stocks).grid(row=3, column=0, pady=2, sticky="ew")
 
+        ttk.Separator(self.right_frame, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=5)
+
+        ttk.Checkbutton(self.right_frame, text="Run NASDAQ Graham Screening", variable=self.nasdaq_screen_var).grid(row=5, column=0, pady=2, padx=2, sticky="w")
+        ttk.Button(self.right_frame, text="Run NASDAQ Screening", command=self.run_nasdaq_screening).grid(row=6, column=0, pady=2, sticky="ew")
+        ttk.Button(self.right_frame, text="Show NASDAQ Qualifying Stocks", command=self.display_nasdaq_qualifying_stocks).grid(row=7, column=0, pady=2, sticky="ew")
+        ttk.Button(self.right_frame, text="Export NASDAQ Qualifying Stocks", command=self.export_nasdaq_qualifying_stocks).grid(row=8, column=0, pady=2, sticky="ew")
+
+        # Treeview and Tabs
         self.full_tree_frame = ttk.Frame(self.main_frame)
         self.full_tree_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
         self.full_tree_frame.grid_columnconfigure(0, weight=1)
@@ -207,7 +206,7 @@ class GrahamScreeningApp:
         self.full_tree_frame.grid_rowconfigure(1, weight=0)
         self.full_tree_frame.grid_rowconfigure(2, weight=1)
 
-        self.tree = ttk.Treeview(self.full_tree_frame, columns=(1, 2, 3, 4, 5, 6, 7), show="tree headings", height=15)
+        self.tree = ttk.Treeview(self.full_tree_frame, columns=(1, 2, 3, 4, 5, 6, 7), show="tree headings", height=10)
         self.v_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="vertical", command=self.tree.yview)
         self.h_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -217,7 +216,7 @@ class GrahamScreeningApp:
 
         self.tree.heading("#0", text="Ticker")
         self.tree.heading(1, text="Company Name")
-        self.tree.heading(2, text="Exchange")
+        self.tree.heading(2, text="Sector")
         self.tree.heading(3, text="Score")
         self.tree.heading(4, text="Price ($)")
         self.tree.heading(5, text="Intrinsic Value ($)")
@@ -248,7 +247,21 @@ class GrahamScreeningApp:
         self.data_frame.grid_columnconfigure(0, weight=1)
         self.data_frame.grid_rowconfigure(0, weight=1)
 
+        self.historical_frame.grid_rowconfigure(0, weight=1)
+        self.historical_frame.grid_columnconfigure(0, weight=1)
+        self.metrics_frame.grid_rowconfigure(0, weight=1)
+        self.metrics_frame.grid_columnconfigure(0, weight=1)
+
+        self.historical_text = scrolledtext.ScrolledText(self.historical_frame, width=70, height=12)
+        self.historical_text.grid(row=0, column=0, sticky="nsew")
+        self.metrics_text = scrolledtext.ScrolledText(self.metrics_frame, width=70, height=12)
+        self.metrics_text.grid(row=0, column=0, sticky="nsew")
+
         self.tree.bind("<<TreeviewSelect>>", self.update_tabs)
+
+    def validate_tickers(self):
+        tickers = self.parse_tickers(self.entry.get())
+        return bool(tickers)
 
     def parse_tickers(self, tickers_input):
         if not tickers_input or not tickers_input.strip():
@@ -264,7 +277,7 @@ class GrahamScreeningApp:
                         favorites = json.load(f)
                         return {k: v if isinstance(v, list) else [] for k, v in favorites.items()}
                 except json.JSONDecodeError:
-                    logging.error(f"Corrupted favorites file {FAVORITES_FILE}")
+                    analyze_logger.error(f"Corrupted favorites file {FAVORITES_FILE}")
                     return {}
             return {}
 
@@ -276,7 +289,7 @@ class GrahamScreeningApp:
                 with open(FAVORITES_FILE, 'w') as f:
                     json.dump(self.favorites, f, indent=4)
             except Exception as e:
-                logging.error(f"Failed to save favorites: {str(e)}")
+                analyze_logger.error(f"Failed to save favorites: {str(e)}")
                 messagebox.showerror("Error", f"Failed to save favorites: {str(e)}")
 
     def update_progress_animated(self, progress, tickers=None, passed_tickers=0, eta=None):
@@ -307,17 +320,18 @@ class GrahamScreeningApp:
 
     def refresh_favorites_dropdown(self, selected_list=None):
         self.favorites = self.load_favorites()
-        logging.debug(f"Refreshed favorites dropdown with keys: {list(self.favorites.keys())}")
+        analyze_logger.debug(f"Refreshed favorites dropdown with keys: {list(self.favorites.keys())}")
         self.favorite_menu['values'] = list(self.favorites.keys())
         if selected_list and selected_list in self.favorites:
             self.favorite_var.set(selected_list)
-            logging.debug(f"Set dropdown to: {selected_list}")
+            analyze_logger.debug(f"Set dropdown to: {selected_list}")
 
     def cancel_screening(self):
         if messagebox.askyesno("Confirm Cancel", "Are you sure you want to cancel the screening?"):
             self.cancel_event.set()
             self.status_label.config(text="Cancelling screening...")
 
+    # Screening Logic
     def run_screening(self, exchange, screen_func):
         if self.screening_active:
             messagebox.showwarning("Warning", f"A {exchange} screening is already in progress.")
@@ -346,7 +360,7 @@ class GrahamScreeningApp:
             if max_timestamp and time.time() - max_timestamp > 365 * 24 * 60 * 60:
                 messagebox.showwarning("Old Data", "The cached data is over a year old. Consider refreshing the data.")
         except sqlite3.Error as e:
-            logging.error(f"Error checking data age: {str(e)}")
+            analyze_logger.error(f"Error checking data age: {str(e)}")
         finally:
             conn.close()
 
@@ -372,20 +386,21 @@ class GrahamScreeningApp:
                     ticker_manager=self.ticker_manager,
                     update_rate_limit=self.update_rate_limit
                 )
-                logging.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
+                screening_logger.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
                 if not self.cancel_event.is_set():
                     if qualifying_stocks:
                         list_name = await save_qualifying_stocks_to_favorites(qualifying_stocks, exchange)
                         if list_name:
                             self.root.after(0, lambda: self.refresh_favorites_dropdown(list_name))
                         else:
-                            logging.error(f"Failed to save qualifying stocks for {exchange}")
+                            screening_logger.error(f"Failed to save qualifying stocks for {exchange}")
                     else:
-                        logging.info(f"No qualifying stocks found for {exchange}")
+                        screening_logger.info(f"No qualifying stocks found for {exchange}")
                     conn, cursor = get_stocks_connection()
                     try:
                         processed_tickers = cursor.execute("SELECT COUNT(*) FROM screening_progress WHERE exchange=? AND status='completed'", (exchange,)).fetchone()[0]
                         total_tickers = processed_tickers + len(error_tickers)
+                        ticker_list = list(self.ticker_manager.get_tickers(exchange))
                         cache_hits = sum(1 for t in ticker_list if get_stock_data_from_db(t) and time.time() - get_stock_data_from_db(t)['timestamp'] < CACHE_EXPIRY)
                         self.root.after(0, lambda: self.update_cache_usage(cache_hits, total_tickers))
                         summary = f"Completed {exchange} screening.\nProcessed {total_tickers} stocks,\nFound {len(qualifying_stocks)} qualifiers,\n{len(error_tickers)} errors"
@@ -393,12 +408,12 @@ class GrahamScreeningApp:
                             summary += f"\nError tickers: {', '.join(error_tickers)}"
                         self.root.after(0, lambda: messagebox.showinfo("Screening Complete", summary))
                     except sqlite3.Error as e:
-                        logging.error(f"Database error in screening summary: {str(e)}")
+                        screening_logger.error(f"Database error in screening summary: {str(e)}")
                     finally:
                         conn.close()
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Screening failed: {str(e)}"))
-                logging.error(f"Screening task failed for {exchange}: {str(e)}", exc_info=True)
+                screening_logger.error(f"Screening task failed for {exchange}: {str(e)}", exc_info=True)
             finally:
                 self.root.after(0, lambda: self.progress_label.config(text=f"Progress: 100% (Screening Complete - {exchange})"))
                 self.root.after(0, lambda: self.status_label.config(text=""))
@@ -414,13 +429,13 @@ class GrahamScreeningApp:
     def run_nasdaq_screening(self):
         self.run_screening("NASDAQ", screen_nasdaq_graham_stocks)
 
+    # Data Fetching and Analysis
     async def fetch_company_name(self, ticker):
-        """Fetch company name from YFinance only."""
         try:
             stock = yf.Ticker(ticker)
             return stock.info.get('longName', 'Unknown')
         except Exception as e:
-            logging.error(f"Error fetching company name for {ticker}: {str(e)}")
+            analyze_logger.error(f"Error fetching company name for {ticker}: {str(e)}")
             return 'Unknown'
 
     def format_float(self, value, precision=2):
@@ -445,42 +460,49 @@ class GrahamScreeningApp:
                 timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').timestamp() if timestamp_str else 0
                 if ((stored_exchange == "NYSE" and stored_hash == nyse_file_hash) or 
                     (stored_exchange == "NASDAQ" and stored_hash == nasdaq_file_hash)) and \
-                   (time.time() - timestamp < 365 * 24 * 60 * 60):
+                   (time.time() - timestamp < CACHE_EXPIRY):
                     cursor.execute("SELECT * FROM stocks WHERE ticker=?", (ticker,))
                     stock_row = cursor.fetchone()
                     if stock_row:
                         columns = [desc[0] for desc in cursor.description]
                         stock_dict = dict(zip(columns, stock_row))
-                        logging.info(f"Database cache hit for {ticker}")
+                        analyze_logger.info(f"Database cache hit for {ticker}")
                         stock = yf.Ticker(ticker)
                         info = stock.info
                         price = info.get('regularMarketPrice', info.get('previousClose', None))
                         if price is None:
-                            logging.error(f"No price data for {ticker} from YFinance")
+                            analyze_logger.error(f"No price data for {ticker} from YFinance")
                             return None
-                        roe_10y = [float(x) if x else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else [0.0] * stock_dict['available_data_years']
-                        rotc_10y = [float(x) if x else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else [0.0] * stock_dict['available_data_years']
-                        eps_10y = [float(x) if x else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else [0.0] * stock_dict['available_data_years']
-                        div_10y = [float(x) if x else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else [0.0] * stock_dict['available_data_years']
+                        roe_list = [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else []
+                        rotc_list = [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else []
+                        eps_list = [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else []
+                        div_list = [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else []
                         balance_data = json.loads(stock_dict['balance_data']) if stock_dict['balance_data'] else []
-                        years = list(range(int(datetime.now().year) - stock_dict['available_data_years'] + 1, int(datetime.now().year) + 1))
+                        years = [int(y) for y in stock_dict['years'].split(",")] if stock_dict.get('years') else []
 
                         company_name = stock_dict['company_name']
                         debt_to_equity = stock_dict['debt_to_equity']
                         eps_ttm = stock_dict['eps_ttm']
                         book_value_per_share = stock_dict['book_value_per_share']
+                        sector = stock_dict.get('sector', 'Unknown')
 
-                        intrinsic_value = calculate_graham_value(eps_ttm, eps_10y) if eps_ttm is not None and eps_ttm > 0 else float('nan')
+                        cached_stock_data = {
+                            "ticker": stock_dict['ticker'],
+                            "sector": sector,
+                            "eps_ttm": eps_ttm,
+                            "eps_list": eps_list
+                        }
+                        intrinsic_value = await calculate_graham_value(eps_ttm, cached_stock_data) if eps_ttm is not None and eps_ttm > 0 else float('nan')
                         margin_of_safety = self.margin_of_safety_var.get() / 100
                         expected_return = self.expected_return_var.get() / 100
                         buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
                         sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
                         latest_revenue = stock_dict['latest_revenue']
-                        graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_10y, div_10y, {}, balance_data, stock_dict['available_data_years'], latest_revenue)
+                        graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data, stock_dict['available_data_years'], latest_revenue)
 
                         result = {
                             "ticker": stock_dict['ticker'],
-                            "exchange": stored_exchange,
+                            "sector": sector,
                             "company_name": company_name,
                             "price": price,
                             "intrinsic_value": intrinsic_value,
@@ -488,10 +510,10 @@ class GrahamScreeningApp:
                             "sell_price": sell_price,
                             "graham_score": graham_score,
                             "years": years,
-                            "roe_10y": roe_10y,
-                            "rotc_10y": rotc_10y,
-                            "eps_10y": eps_10y,
-                            "div_10y": div_10y,
+                            "roe_list": roe_list,
+                            "rotc_list": rotc_list,
+                            "eps_list": eps_list,
+                            "div_list": div_list,
                             "balance_data": balance_data,
                             "latest_revenue": latest_revenue,
                             "available_data_years": stock_dict['available_data_years'],
@@ -501,12 +523,12 @@ class GrahamScreeningApp:
                         }
                         with self.ticker_cache_lock:
                             self.ticker_cache[ticker] = result
-                        logging.debug(f"Cached data retrieved for {ticker}: Score={graham_score}/8 with {stock_dict['available_data_years']} years")
+                        analyze_logger.debug(f"Cached data retrieved for {ticker}: Score={graham_score}/8 with {stock_dict['available_data_years']} years")
                         return result
-            logging.info(f"Cache miss for {ticker}: Data stale or missing")
+            analyze_logger.info(f"Cache miss for {ticker}: Data stale or missing")
             return None
         except sqlite3.Error as e:
-            logging.error(f"Database error in fetch_cached_data for {ticker}: {str(e)}")
+            analyze_logger.error(f"Database error in fetch_cached_data for {ticker}: {str(e)}")
             return None
         finally:
             conn.close()
@@ -522,7 +544,8 @@ class GrahamScreeningApp:
         return "Unknown"
 
     async def analyze_multiple_stocks_async(self, tickers):
-        # Exclude invalid tickers from analysis
+        analyze_logger.info(f"Starting analysis for tickers: {tickers}")
+
         nyse_invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
         nasdaq_invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
         invalid_tickers = set()
@@ -533,11 +556,12 @@ class GrahamScreeningApp:
         valid_tickers = [t for t in tickers if t not in invalid_tickers]
         if len(valid_tickers) < len(tickers):
             excluded = set(tickers) - set(valid_tickers)
-            logging.info(f"Excluded {len(excluded)} invalid tickers: {excluded}")
+            analyze_logger.info(f"Excluded {len(excluded)} invalid tickers: {excluded}")
             self.root.after(0, lambda: messagebox.showinfo("Excluded Tickers", f"Excluded {len(excluded)} invalid tickers: {', '.join(excluded)}"))
         tickers = valid_tickers
 
         if not tickers:
+            analyze_logger.warning("No valid tickers provided for analysis")
             messagebox.showwarning("No Tickers", "No valid tickers to analyze.")
             return
 
@@ -546,9 +570,12 @@ class GrahamScreeningApp:
             cursor.execute("SELECT MAX(timestamp) FROM stocks")
             max_timestamp = cursor.fetchone()[0]
             if max_timestamp and time.time() - max_timestamp > 365 * 24 * 60 * 60:
+                analyze_logger.warning("Cached data is over a year old")
                 messagebox.showwarning("Old Data", "The cached data is over a year old. Consider refreshing the data.")
+            else:
+                analyze_logger.info(f"Most recent data timestamp: {max_timestamp}")
         except sqlite3.Error as e:
-            logging.error(f"Error checking data age: {str(e)}")
+            analyze_logger.error(f"Error checking data age: {str(e)}")
         finally:
             conn.close()
 
@@ -560,6 +587,7 @@ class GrahamScreeningApp:
         self.status_label.config(text="Analyzing stocks...")
         self.root.update()
 
+        analyze_logger.info(f"Fetching data for {len(tickers)} tickers with margin_of_safety={self.margin_of_safety_var.get()/100}, expected_return={self.expected_return_var.get()/100}")
         results, error_tickers = await fetch_batch_data(
             tickers,
             screening_mode=False,
@@ -572,20 +600,21 @@ class GrahamScreeningApp:
         valid_results = [r for r in results if 'error' not in r]
         passed_tickers = sum(1 for r in valid_results if r.get('graham_score', 0) >= 5 and r.get('available_data_years', 0) >= 10)
 
+        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} errors")
         if error_tickers:
+            analyze_logger.warning(f"Error tickers: {error_tickers}")
             error_summary = "\n".join(error_tickers)
             self.root.after(0, lambda: messagebox.showwarning("Analysis Errors", f"Errors occurred for the following tickers:\n{error_summary}"))
 
+        analyze_logger.debug("Populating treeview with analysis results")
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for widget in self.historical_frame.winfo_children():
-            widget.destroy()
-        for widget in self.metrics_frame.winfo_children():
-            widget.destroy()
 
         for result in valid_results:
             years_used = result.get('available_data_years', 0)
+            analyze_logger.debug(f"Processing result for {result['ticker']}: Graham Score={result['graham_score']}, Years={years_used}")
             if years_used < 10:
+                analyze_logger.warning(f"{result['ticker']} has only {years_used} years of data")
                 self.root.after(0, lambda t=result['ticker'], y=years_used: messagebox.showwarning("Insufficient Data", f"{t} has only {y} years of data. Results may be incomplete."))
             warning = f" (based on {years_used} years)" if years_used < 10 else ""
             price = result['price']
@@ -593,7 +622,7 @@ class GrahamScreeningApp:
             tags = ('highlight',) if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price) else ()
             self.tree.insert("", "end", text=result['ticker'], values=(
                 result['company_name'],
-                result['exchange'],
+                result['sector'],
                 f"{result['graham_score']}/8{warning}",
                 f"${self.format_float(result['price'])}",
                 f"${self.format_float(result['intrinsic_value'])}",
@@ -601,42 +630,29 @@ class GrahamScreeningApp:
                 f"${self.format_float(result['sell_price'])}"
             ), tags=tags)
 
+        cache_hits = sum(1 for t in tickers if t in self.ticker_cache)
+        analyze_logger.info(f"Cache usage: {cache_hits} hits out of {len(tickers)} total tickers")
+        self.root.after(0, lambda: self.update_cache_usage(cache_hits, len(tickers)))
         self.root.after(0, lambda: self.update_progress_animated(100, tickers, passed_tickers))
         self.root.after(0, lambda: self.status_label.config(text=""))
+        analyze_logger.info("Analysis fully completed and UI updated")
 
     def analyze_multiple_stocks(self, tickers_input=None):
+        analyze_logger.info("Analyze Stocks button clicked")
         if self.analysis_lock.acquire(timeout=5):
             try:
                 if tickers_input is None:
                     tickers_input = self.entry.get()
                 tickers = self.parse_tickers(tickers_input)
+                analyze_logger.info(f"Parsed tickers from input '{tickers_input}': {tickers}")
+                if not tickers:
+                    analyze_logger.warning("No tickers parsed from input")
                 self.task_queue.put(self.analyze_multiple_stocks_async(tickers))
             finally:
                 self.analysis_lock.release()
         else:
+            analyze_logger.error("Failed to acquire analysis lock within 5 seconds")
             messagebox.showerror("Error", "Unable to start analysis: Lock timeout.")
-
-    def refresh_multiple_stocks(self, tickers_input=None):
-        if tickers_input is None:
-            tickers_input = self.entry.get()
-        tickers = self.parse_tickers(tickers_input)
-        if not tickers:
-            messagebox.showwarning("No Tickers", "No valid tickers to refresh.")
-            return
-
-        conn, cursor = get_stocks_connection()
-        try:
-            for ticker in tickers:
-                cursor.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
-                with self.ticker_cache_lock:
-                    if ticker in self.ticker_cache:
-                        del self.ticker_cache[ticker]
-            conn.commit()
-        except sqlite3.Error as e:
-            logging.error(f"Database error in refresh_multiple_stocks: {str(e)}")
-        finally:
-            conn.close()
-        self.task_queue.put(self.analyze_multiple_stocks_async(tickers))
 
     async def display_results_in_tree(self, tickers, scores, exchanges, source):
         for item in self.tree.get_children():
@@ -707,16 +723,6 @@ class GrahamScreeningApp:
 
         self.sort_tree(0)
 
-    async def fetch_metrics_data(self, ticker):
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        balance_data = await fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", FMP_API_KEYS)
-        income_data = await fetch_with_multiple_keys_async(ticker, "income-statement", FMP_API_KEYS)
-        revenue = {str(entry.get('calendarYear', 0)): float(entry.get('revenue', 0)) for entry in income_data if 'calendarYear' in entry} if income_data else {}
-        latest_balance = balance_data[0] if balance_data and len(balance_data) > 0 else {}
-        latest_income = income_data[0] if income_data and len(income_data) > 0 else {}
-        return info, revenue, latest_balance, latest_income
-
     def update_tabs(self, event):
         selected = self.tree.selection()
         if not selected:
@@ -727,90 +733,110 @@ class GrahamScreeningApp:
             result = self.ticker_cache.get(ticker, None)
 
         if not result:
-            return
+            analyze_logger.warning(f"No cached data found for {ticker}, fetching fresh data")
+            async def fetch_fresh():
+                fresh_result = await fetch_stock_data(
+                    ticker,
+                    expected_return=self.expected_return_var.get() / 100,
+                    margin_of_safety=self.margin_of_safety_var.get() / 100,
+                    ticker_manager=self.ticker_manager
+                )
+                with self.ticker_cache_lock:
+                    self.ticker_cache[ticker] = fresh_result
+                return fresh_result
+            result = asyncio.run(fetch_fresh())
 
-        for widget in self.historical_frame.winfo_children():
-            widget.destroy()
-        for widget in self.metrics_frame.winfo_children():
-            widget.destroy()
+        analyze_logger.info(f"Updating tabs for {ticker} with data keys: {list(result.keys())}")
 
-        historical_text = scrolledtext.ScrolledText(self.historical_frame, width=70, height=10)
-        historical_text.grid(row=0, column=0, sticky="nsew")
-        metrics_text = scrolledtext.ScrolledText(self.metrics_frame, width=70, height=10)
-        metrics_text.grid(row=0, column=0, sticky="nsew")
+        self.root.after(0, lambda: self.historical_text.delete('1.0', tk.END))
+        self.root.after(0, lambda: self.metrics_text.delete('1.0', tk.END))
 
         years = result.get('years', [])
-        roe_available = result.get('roe_10y', [])
-        rotc_available = result.get('rotc_10y', [])
-        eps_available = result.get('eps_10y', [])
-        div_available = result.get('div_10y', [])
+        roe_list = result.get('roe_list', [])
+        rotc_list = result.get('rotc_list', [])
+        eps_list = result.get('eps_list', [])
+        div_list = result.get('div_list', [])
 
-        if years and len(years) == len(roe_available) == len(rotc_available) == len(eps_available) == len(div_available):
-            historical_text.insert(tk.END, f"{len(years)}-Year Historical Data for {ticker}:\nYear\tROE (%)\tROTC (%)\tEPS ($)\tDividend ($)\n")
+        analyze_logger.debug(f"Historical data for {ticker}: years={len(years)}, roe={len(roe_list)}, rotc={len(rotc_list)}, eps={len(eps_list)}, dividend={len(div_list)}")
+        analyze_logger.debug(f"Years: {years}")
+        analyze_logger.debug(f"ROE: {roe_list}")
+        analyze_logger.debug(f"ROTC: {rotc_list}")
+        analyze_logger.debug(f"EPS: {eps_list}")
+        analyze_logger.debug(f"Dividend: {div_list}")
+
+        if not years:
+            self.root.after(0, lambda: self.historical_text.insert(tk.END, f"No historical data available for {ticker}\n"))
+        elif len(years) == len(roe_list) == len(rotc_list) == len(eps_list) == len(div_list):
+            header = f"{len(years)}-Year Historical Data for {ticker}:\nYear\tROE (%)\tROTC (%)\tEPS ($)\tDividend ($)\n"
+            self.root.after(0, lambda: self.historical_text.insert(tk.END, header))
             for j in range(len(years)):
-                historical_text.insert(tk.END, f"{years[j]}\t{roe_available[j]:.2f}\t{rotc_available[j]:.2f}\t{eps_available[j]:.2f}\t{div_available[j]:.2f}\n")
+                line = f"{years[j]}\t{roe_list[j]:.2f}\t{rotc_list[j]:.2f}\t{eps_list[j]:.2f}\t{div_list[j]:.2f}\n"
+                self.root.after(0, lambda l=line: self.historical_text.insert(tk.END, l))
         else:
-            historical_text.insert(tk.END, f"Incomplete Historical Data for {ticker}:\n")
+            message = f"Incomplete Historical Data for {ticker} (Years: {len(years)}, ROE: {len(roe_list)}, ROTC: {len(rotc_list)}, EPS: {len(eps_list)}, Dividend: {len(div_list)})\n"
+            self.root.after(0, lambda m=message: self.historical_text.insert(tk.END, m))
 
-        metrics_text.insert(tk.END, f"Graham Criteria Results for {ticker} (Score: {result['graham_score']}/8 with {result['available_data_years']} years):\n")
-
-        tooltip_label = ttk.Label(self.metrics_frame, text="Hover over criteria for details", font=("Helvetica", 8), foreground="gray")
-        tooltip_label.grid(row=1, column=0, pady=2)
+        self.root.after(0, lambda: self.metrics_text.insert(tk.END, f"Graham Criteria Results for {ticker} (Score: {result['graham_score']}/8 with {result['available_data_years']} years):\n"))
+        self.root.after(0, lambda: self.metrics_text.insert(tk.END, f"Sector: {result['sector']} (Growth Rate: {get_sector_growth_rate(result['sector'])}%)\n\n"))
 
         async def update_metrics():
-            try:
-                info, revenue, latest_balance, latest_income = await self.fetch_metrics_data(ticker)
-                latest_revenue = max((float(v) for k, v in revenue.items() if k.isdigit()), default=0)
-                revenue_pass = latest_revenue >= 500_000_000
-                metrics_text.insert(tk.END, f"1. Revenue >= $500M: {'Yes' if revenue_pass else 'No'} (${latest_revenue / 1e6:.2f}M)\n")
+            stock_data = get_stock_data_from_db(ticker)
+            if not stock_data:
+                self.safe_insert(self.metrics_text, f"No data available for {ticker}\n")
+                return
 
-                current_assets = float(latest_balance.get('totalCurrentAssets', 0))
-                current_liabilities = float(latest_balance.get('totalCurrentLiabilities', 1))
+            eps_list = stock_data['eps_list']
+            div_list = stock_data['div_list']
+            balance_data = stock_data['balance_data']
+            latest_revenue = stock_data['latest_revenue']
+            debt_to_equity = stock_data['debt_to_equity']
+            available_data_years = stock_data['available_data_years']
+            sector = stock_data['sector']
+            eps_ttm = stock_data['eps_ttm']
+            book_value_per_share = stock_data['book_value_per_share']
+            price = result.get('price', None)
+
+            revenue_passed = latest_revenue >= 500_000_000
+            self.safe_insert(self.metrics_text, f"1. Revenue >= $500M: {'Yes' if revenue_passed else 'No'} (${latest_revenue / 1e6:.2f}M)\n")
+
+            if balance_data and 'totalCurrentAssets' in balance_data[0] and 'totalCurrentLiabilities' in balance_data[0]:
+                current_assets = float(balance_data[0].get('totalCurrentAssets', 0))
+                current_liabilities = float(balance_data[0].get('totalCurrentLiabilities', 1))
                 current_ratio = current_assets / current_liabilities if current_liabilities > 0 else 0
-                current_pass = current_ratio > 2
-                metrics_text.insert(tk.END, f"2. Current Ratio > 2: {'Yes' if current_pass else 'No'} ({current_ratio:.2f})\n")
+                current_passed = current_ratio > 2
+                self.safe_insert(self.metrics_text, f"2. Current Ratio > 2: {'Yes' if current_passed else 'No'} ({current_ratio:.2f})\n")
+            else:
+                self.safe_insert(self.metrics_text, "2. Current Ratio > 2: No (Missing data)\n")
 
-                eps_10y = result.get('eps_10y', [])
-                expected_years = result['available_data_years']
-                negative_eps_count = sum(1 for eps in eps_10y if eps <= 0)
-                max_negative_years = min(2, expected_years // 5)
-                stability_pass = negative_eps_count <= max_negative_years
-                metrics_text.insert(tk.END, f"3. Earnings Stability (<= {max_negative_years} negative years): {'Yes' if stability_pass else 'No'} ({negative_eps_count} negatives)\n")
+            max_negative_years = min(2, available_data_years // 5)
+            negative_eps_count = sum(1 for eps in eps_list if eps <= 0)
+            stability_passed = negative_eps_count <= max_negative_years
+            self.safe_insert(self.metrics_text, f"3. Earnings Stability (<= {max_negative_years} negative years): {'Yes' if stability_passed else 'No'} ({negative_eps_count} negatives)\n")
 
-                div_10y = result.get('div_10y', [])
-                dividend_pass = len(div_10y) >= expected_years and all(div > 0 for div in div_10y)
-                metrics_text.insert(tk.END, f"4. Uninterrupted Dividends ({expected_years} yrs): {'Yes' if dividend_pass else 'No'}\n")
+            dividend_passed = all(div > 0 for div in div_list) if div_list else False
+            div_display = f" (Dividends: {', '.join(f'{d:.2f}' for d in div_list)})" if div_list else ""
+            self.safe_insert(self.metrics_text, f"4. Uninterrupted Dividends: {'Yes' if dividend_passed else 'No'}{div_display}\n")
 
-                eps_growth_pass = False
-                if expected_years >= 2:
-                    first_eps = eps_10y[0]
-                    last_eps = eps_10y[-1]
-                    if first_eps > 0 and last_eps > 0:
-                        cagr = (last_eps / first_eps) ** (1 / (expected_years - 1)) - 1
-                        eps_growth_pass = cagr > 0.03
-                        metrics_text.insert(tk.END, f"5. EPS CAGR > 3%: {'Yes' if eps_growth_pass else 'No'} ({cagr:.2%})\n")
-                    else:
-                        metrics_text.insert(tk.END, f"5. EPS CAGR > 3%: No (Invalid EPS data)\n")
-                else:
-                    metrics_text.insert(tk.END, f"5. EPS CAGR > 3%: No (Insufficient data)\n")
+            if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
+                cagr = calculate_cagr(eps_list[0], eps_list[-1], available_data_years - 1)
+                growth_passed = cagr > 0.03
+                self.safe_insert(self.metrics_text, f"5. EPS CAGR > 3%: {'Yes' if growth_passed else 'No'} ({cagr:.2%})\n")
+            else:
+                eps_display = f" (EPS: {', '.join(f'{e:.2f}' for e in eps_list)})" if eps_list else ""
+                self.safe_insert(self.metrics_text, f"5. EPS CAGR > 3%: No (Insufficient or invalid data{eps_display})\n")
 
-                debt_to_equity = result.get('debt_to_equity', None)
-                debt_pass = debt_to_equity is not None and debt_to_equity < 2
-                metrics_text.insert(tk.END, f"6. Debt-to-Equity < 2: {'Yes' if debt_pass else 'No'} ({self.format_float(debt_to_equity)})\n")
+            debt_passed = debt_to_equity is not None and debt_to_equity < 2
+            self.safe_insert(self.metrics_text, f"6. Debt-to-Equity < 2: {'Yes' if debt_passed else 'No'} ({self.format_float(debt_to_equity)})\n")
 
-                price = result.get('price', None)
-                eps_ttm = result.get('eps_ttm', None)
-                book_value_per_share = result.get('book_value_per_share', None)
-                pe_ratio = price / eps_ttm if price and eps_ttm and eps_ttm > 0 else None
-                pe_pass = pe_ratio is not None and pe_ratio <= 15
-                metrics_text.insert(tk.END, f"7. P/E Ratio <= 15: {'Yes' if pe_pass else 'No'} ({self.format_float(pe_ratio)})\n")
+            pe_ratio = price / eps_ttm if price and eps_ttm and eps_ttm > 0 else None
+            pe_pass = pe_ratio is not None and pe_ratio <= 15
+            self.safe_insert(self.metrics_text, f"7. P/E Ratio <= 15: {'Yes' if pe_pass else 'No'} ({self.format_float(pe_ratio)})\n")
 
-                pb_ratio = price / book_value_per_share if price and book_value_per_share and book_value_per_share > 0 else None
-                pb_pass = pb_ratio is not None and pb_ratio <= 1.5
-                metrics_text.insert(tk.END, f"8. P/B Ratio <= 1.5: {'Yes' if pb_pass else 'No'} ({self.format_float(pb_ratio)})\n")
-            except Exception as e:
-                logging.error(f"Error updating metrics for {ticker}: {str(e)}")
-                metrics_text.insert(tk.END, f"Error fetching metrics: {str(e)}\n")
+            pb_ratio = price / book_value_per_share if price and book_value_per_share and book_value_per_share > 0 else None
+            pb_pass = pb_ratio is not None and pb_ratio <= 1.5
+            self.safe_insert(self.metrics_text, f"8. P/B Ratio <= 1.5: {'Yes' if pb_pass else 'No'} ({self.format_float(pb_ratio)})\n")
+
+            analyze_logger.info(f"Metrics updated for {ticker} using cached data")
 
         self.task_queue.put(update_metrics())
 
@@ -845,78 +871,113 @@ class GrahamScreeningApp:
     def display_nyse_qualifying_stocks(self):
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute("""
-                SELECT g.ticker, s.company_name, g.common_score 
-                FROM graham_qualifiers g 
-                JOIN stocks s ON g.ticker = s.ticker 
-                WHERE g.exchange='NYSE' AND g.common_score IS NOT NULL
-                ORDER BY g.common_score DESC, g.ticker ASC
+            cursor.execute(""" 
+                SELECT ticker, common_score, sector 
+                FROM graham_qualifiers 
+                WHERE exchange='NYSE' AND common_score IS NOT NULL
+                ORDER BY common_score DESC, ticker ASC
             """)
-            results = cursor.fetchall()
+            qualifier_results = cursor.fetchall()
 
-            if not results:
+            if not qualifier_results:
                 messagebox.showinfo("No Results", "No NYSE stocks meet the Graham criteria.")
+                analyze_logger.info("No qualifying NYSE stocks found in graham_qualifiers.")
                 return
+
+            cursor.execute("SELECT ticker, company_name FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NYSE')")
+            ticker_to_company = {row[0]: row[1] for row in cursor.fetchall()}
 
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            for ticker, company_name, common_score in results:
-                self.tree.insert("", "end", text=ticker, values=(company_name, "NYSE", f"{common_score}/6", "", "", "", ""))
+            for ticker, common_score, sector in qualifier_results:
+                company_name = ticker_to_company.get(ticker, "Unknown")
+                self.tree.insert("", "end", text=ticker, values=(company_name, sector, f"{common_score}/6", "", "", "", ""))
+                analyze_logger.debug(f"Added {ticker} to treeview: {company_name}, Sector: {sector}, Score: {common_score}/6")
+
+            analyze_logger.info(f"Displayed {len(qualifier_results)} NYSE qualifying stocks in treeview.")
         except sqlite3.Error as e:
-            logging.error(f"Database error in display_nyse_qualifying_stocks: {str(e)}")
+            analyze_logger.error(f"Database error in display_nyse_qualifying_stocks: {str(e)}")
+            messagebox.showerror("Error", f"Database error: {str(e)}")
         finally:
             conn.close()
 
     def display_nasdaq_qualifying_stocks(self):
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute("""
-                SELECT g.ticker, s.company_name, g.common_score 
-                FROM graham_qualifiers g 
-                JOIN stocks s ON g.ticker = s.ticker 
-                WHERE g.exchange='NASDAQ' AND g.common_score IS NOT NULL
-                ORDER BY g.common_score DESC, g.ticker ASC
+            cursor.execute(""" 
+                SELECT ticker, common_score, sector 
+                FROM graham_qualifiers 
+                WHERE exchange='NASDAQ' AND common_score IS NOT NULL
+                ORDER BY common_score DESC, ticker ASC
             """)
-            results = cursor.fetchall()
+            qualifier_results = cursor.fetchall()
 
-            if not results:
+            if not qualifier_results:
                 messagebox.showinfo("No Results", "No NASDAQ stocks meet the Graham criteria.")
+                analyze_logger.info("No qualifying NASDAQ stocks found in graham_qualifiers.")
                 return
+
+            cursor.execute("SELECT ticker, company_name FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NASDAQ')")
+            ticker_to_company = {row[0]: row[1] for row in cursor.fetchall()}
 
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            for ticker, company_name, common_score in results:
-                self.tree.insert("", "end", text=ticker, values=(company_name, "NASDAQ", f"{common_score}/6", "", "", "", ""))
+            for ticker, common_score, sector in qualifier_results:
+                company_name = ticker_to_company.get(ticker, "Unknown")
+                self.tree.insert("", "end", text=ticker, values=(company_name, sector, f"{common_score}/6", "", "", "", ""))
+                analyze_logger.debug(f"Added {ticker} to treeview: {company_name}, Sector: {sector}, Score: {common_score}/6")
+
+            analyze_logger.info(f"Displayed {len(qualifier_results)} NASDAQ qualifying stocks in treeview.")
         except sqlite3.Error as e:
-            logging.error(f"Database error in display_nasdaq_qualifying_stocks: {str(e)}")
+            analyze_logger.error(f"Database error in display_nasdaq_qualifying_stocks: {str(e)}")
+            messagebox.showerror("Error", f"Database error: {str(e)}")
         finally:
             conn.close()
 
     def export_nyse_qualifying_stocks(self):
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute("SELECT ticker, company_name, common_score FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NYSE')")
+            cursor.execute(""" 
+                SELECT ticker, company_name, common_score 
+                FROM stocks 
+                WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NYSE')
+            """)
             results = cursor.fetchall()
+
             if not results:
                 messagebox.showinfo("No Data", "No NYSE qualifying stocks to export.")
+                analyze_logger.info("No NYSE qualifying stocks found for export.")
                 return
 
             df = pd.DataFrame(results, columns=["Ticker", "Company Name", "Common Score"])
-            file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                title="Save NYSE Qualifying Stocks"
+            )
+
             if file_path:
                 df.to_csv(file_path, index=False)
                 messagebox.showinfo("Export Successful", f"NYSE qualifying stocks exported to {file_path}")
+                analyze_logger.info(f"Exported {len(results)} NYSE qualifying stocks to {file_path}")
+
         except sqlite3.Error as e:
-            logging.error(f"Database error in export_nyse_qualifying_stocks: {str(e)}")
+            analyze_logger.error(f"Database error in export_nyse_qualifying_stocks: {str(e)}")
+            messagebox.showerror("Error", f"Database error: {str(e)}")
         finally:
             conn.close()
 
     def export_nasdaq_qualifying_stocks(self):
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute("SELECT ticker, company_name, common_score FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NASDAQ')")
+            cursor.execute(""" 
+                SELECT ticker, company_name, common_score 
+                FROM stocks 
+                WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NASDAQ')
+            """)
             results = cursor.fetchall()
             if not results:
                 messagebox.showinfo("No Data", "No NASDAQ qualifying stocks to export.")
@@ -928,9 +989,13 @@ class GrahamScreeningApp:
                 df.to_csv(file_path, index=False)
                 messagebox.showinfo("Export Successful", f"NASDAQ qualifying stocks exported to {file_path}")
         except sqlite3.Error as e:
-            logging.error(f"Database error in export_nasdaq_qualifying_stocks: {str(e)}")
+            analyze_logger.error(f"Database error in export_nasdaq_qualifying_stocks: {str(e)}")
+            messagebox.showerror("Error", f"Database error: {str(e)}")
         finally:
             conn.close()
+
+    def safe_insert(self, widget, text):
+        self.root.after(0, lambda: widget.insert(tk.END, text))
 
     def clear_cache(self):
         conn, cursor = get_stocks_connection()
@@ -943,8 +1008,9 @@ class GrahamScreeningApp:
                 self.ticker_cache.clear()
             clear_in_memory_caches()
             messagebox.showinfo("Cache Cleared", "All caches have been cleared.")
+            analyze_logger.info("All caches cleared successfully.")
         except sqlite3.Error as e:
-            logging.error(f"Error clearing cache: {str(e)}")
+            analyze_logger.error(f"Error clearing cache: {str(e)}")
             messagebox.showerror("Error", f"Failed to clear cache: {str(e)}")
         finally:
             conn.close()
@@ -980,7 +1046,7 @@ class GrahamScreeningApp:
             for ticker, company_name, common_score in results:
                 self.tree.insert("", "end", text=ticker, values=(company_name, "Unknown", f"{common_score}/6", "", "", "", ""))
         except sqlite3.Error as e:
-            logging.error(f"Database error in filter_tree: {str(e)}")
+            analyze_logger.error(f"Database error in filter_tree: {str(e)}")
         finally:
             conn.close()
 
@@ -1003,9 +1069,9 @@ class GrahamScreeningApp:
                     with open(local_file, 'wb') as f:
                         ftp.retrbinary(f'RETR /SymbolDirectory/{remote_file}', f.write)
                     ftp.quit()
-                    logging.info(f"Updated {local_file} from FTP")
+                    analyze_logger.info(f"Updated {local_file} from FTP")
                 except Exception as e:
-                    logging.error(f"Failed to update {local_file}: {str(e)}")
+                    analyze_logger.error(f"Failed to update {local_file}: {str(e)}")
                     self.root.after(0, lambda: messagebox.showerror("Update Error", f"Failed to update {local_file}: {str(e)}"))
                     return
             await self.ticker_manager.initialize()
@@ -1019,6 +1085,16 @@ class GrahamScreeningApp:
         self.asyncio_thread.join(timeout=2)
         with self.ticker_cache_lock:
             self.ticker_cache.clear()
+        # Close logging handlers
+        for handler in screening_logger.handlers[:]:
+            handler.close()
+            screening_logger.removeHandler(handler)
+        for handler in analyze_logger.handlers[:]:
+            handler.close()
+            analyze_logger.removeHandler(handler)
+        for handler in logging.getLogger().handlers[:]:
+            handler.close()
+            logging.getLogger().removeHandler(handler)
         self.root.destroy()
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import concurrent.futures
 import requests
 import random
 from config import (FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, NYSE_LIST_FILE, NASDAQ_LIST_FILE,
-                    DATA_DIR, FAVORITES_LOCK, FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID)
+                    DATA_DIR, FAVORITES_LOCK, FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID, screening_logger, analyze_logger)
 
 # Constants for batch processing and concurrency control
 MAX_CONCURRENT_TICKERS = 10
@@ -35,6 +35,22 @@ aaa_yield_cache = None
 cache_timestamp = None
 CACHE_DURATION = timedelta(days=1)
 
+# Hardcoded sector growth rates
+SECTOR_GROWTH_RATES = {
+    "Energy": 4.0,
+    "Materials": 4.0,
+    "Industrials": 3.5,
+    "Consumer Discretionary": 3.0,
+    "Consumer Staples": 3.0,
+    "Health Care": 5.5,
+    "Financials": 4.5,
+    "Information Technology": 6.0,
+    "Communication Services": 5.0,
+    "Utilities": 3.0,
+    "Real Estate": 3.0,
+    "Unknown": 4.0  # Default growth rate
+}
+
 def get_aaa_yield(api_key, default_yield=0.045):
     """Fetch Moody's Seasoned AAA Corporate Bond Yield from FRED with caching."""
     global aaa_yield_cache, cache_timestamp
@@ -45,7 +61,7 @@ def get_aaa_yield(api_key, default_yield=0.045):
             return aaa_yield_cache
 
     if not api_key:
-        logging.error("FRED_API_KEY not set. Using default yield: 4.5%")
+        analyze_logger.error("FRED_API_KEY not set. Using default yield: 4.5%")
         return default_yield
 
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=AAA&api_key={api_key}&file_type=json&limit=1&sort_order=desc"
@@ -57,17 +73,17 @@ def get_aaa_yield(api_key, default_yield=0.045):
             yield_value = float(data['observations'][0]['value']) / 100
             aaa_yield_cache = yield_value
             cache_timestamp = current_time
-            logging.info(f"Fetched AAA yield: {yield_value:.4f}")
+            analyze_logger.info(f"Fetched AAA yield: {yield_value:.4f}")
             return yield_value
         else:
             raise ValueError("No observations found in FRED response")
     except requests.RequestException as e:
-        logging.error(f"Error fetching AAA yield from FRED: {str(e)}")
+        analyze_logger.error(f"Error fetching AAA yield from FRED: {str(e)}")
         if aaa_yield_cache is not None:
-            logging.info("Using cached AAA yield due to fetch error")
+            analyze_logger.info("Using cached AAA yield due to fetch error")
             return aaa_yield_cache
         else:
-            logging.info(f"Using default AAA yield: {default_yield}")
+            analyze_logger.info(f"Using default AAA yield: {default_yield}")
             return default_yield
 
 def get_stocks_connection():
@@ -91,13 +107,21 @@ def get_stocks_connection():
             book_value_per_share REAL,
             common_score INTEGER,
             latest_revenue REAL,
-            available_data_years INTEGER
+            available_data_years INTEGER,
+            sector TEXT,
+            years TEXT
         )''')
         cursor.execute("PRAGMA table_info(stocks)")
         columns = [col[1] for col in cursor.fetchall()]
         if 'available_data_years' not in columns:
             cursor.execute("ALTER TABLE stocks ADD COLUMN available_data_years INTEGER")
-            logging.info("Added 'available_data_years' column to stocks table")
+            analyze_logger.info("Added 'available_data_years' column to stocks table")
+        if 'sector' not in columns:
+            cursor.execute("ALTER TABLE stocks ADD COLUMN sector TEXT")
+            analyze_logger.info("Added 'sector' column to stocks table")
+        if 'years' not in columns:
+            cursor.execute("ALTER TABLE stocks ADD COLUMN years TEXT")
+            analyze_logger.info("Added 'years' column to stocks table")
         cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
             ticker TEXT PRIMARY KEY,
             common_score INTEGER,
@@ -114,10 +138,16 @@ def get_stocks_connection():
             PRIMARY KEY (exchange, ticker)
         )''')
         conn.commit()
-        return conn, cursor
     except sqlite3.Error as e:
-        logging.error(f"Failed to initialize database connection: {str(e)}")
+        analyze_logger.error(f"Failed to initialize database connection: {str(e)}")
         raise
+    return conn, cursor
+
+def get_sector_growth_rate(sector: str) -> float:
+    """Fetch the growth rate for a given sector from the hardcoded dictionary."""
+    growth_rate = SECTOR_GROWTH_RATES.get(sector, SECTOR_GROWTH_RATES["Unknown"])
+    analyze_logger.debug(f"Retrieved growth rate for sector '{sector}': {growth_rate}%")
+    return growth_rate
 
 def get_file_hash(file_path: str) -> str:
     """Compute SHA-256 hash of a file for versioning."""
@@ -128,6 +158,23 @@ def get_file_hash(file_path: str) -> str:
         raise FileHashError(f"File not found: {file_path}")
     except Exception as e:
         raise FileHashError(f"Error computing hash for {file_path}: {str(e)}")
+
+def map_fmp_sector_to_app(sector: str) -> str:
+    """Map FMP sector names to app's sector names."""
+    mapping = {
+        "Technology": "Information Technology",
+        "Healthcare": "Health Care",
+        "Consumer Cyclical": "Consumer Discretionary",
+        "Consumer Defensive": "Consumer Staples",
+        "Basic Materials": "Materials",
+        "Communication Services": "Communication Services",
+        "Financial Services": "Financials",
+        "Utilities": "Utilities",
+        "Industrials": "Industrials",
+        "Energy": "Energy",
+        "Real Estate": "Real Estate"
+    }
+    return mapping.get(sector, 'Unknown')
 
 class TickerManager:
     def __init__(self, nyse_file: str, nasdaq_file: str):
@@ -143,8 +190,8 @@ class TickerManager:
         self.filtered_nasdaq = await load_and_filter_tickers(self.nasdaq_file, exchange_filter='Q', use_cache=True)
         self.nyse_tickers = {ticker["ticker"]: ticker["security_name"] for ticker in self.filtered_nyse}
         self.nasdaq_tickers = {ticker["ticker"]: ticker["security_name"] for ticker in self.filtered_nasdaq}
-        logging.info(f"Initialized NYSE common stock tickers: {len(self.nyse_tickers)}")
-        logging.info(f"Initialized NASDAQ common stock tickers: {len(self.nasdaq_tickers)}")
+        analyze_logger.info(f"Initialized NYSE common stock tickers: {len(self.nyse_tickers)}")
+        analyze_logger.info(f"Initialized NASDAQ common stock tickers: {len(self.nasdaq_tickers)}")
 
     def get_tickers(self, exchange: str) -> set:
         if exchange == "NYSE":
@@ -163,17 +210,17 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
     try:
         file_hash = get_file_hash(file_path)
     except FileHashError as e:
-        logging.error(str(e))
+        analyze_logger.error(str(e))
         return []
 
-    logging.debug(f"Computed hash for {file_path}: {file_hash}")
+    analyze_logger.debug(f"Computed hash for {file_path}: {file_hash}")
 
     conn, cursor = get_stocks_connection()
     try:
         cursor.execute("SELECT ticker, timestamp, company_name FROM stocks WHERE ticker_list_hash = ?", (file_hash,))
         cached_data = cursor.fetchall()
         cached_entries = {row[0]: (row[1], row[2]) for row in cached_data}
-        logging.debug(f"Loaded {len(cached_entries)} entries from stocks table for hash {file_hash}")
+        analyze_logger.debug(f"Loaded {len(cached_entries)} entries from stocks table for hash {file_hash}")
 
         ticker_data = []
         fresh_count = 0
@@ -191,7 +238,7 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
             else:
                 raise ValueError(f"Unknown file format: {file_path}")
 
-            logging.debug(f"Using ticker column '{ticker_column}' for {file_path}")
+            analyze_logger.debug(f"Using ticker column '{ticker_column}' for {file_path}")
 
             try:
                 symbol_idx = headers.index(ticker_column)
@@ -232,19 +279,19 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
                     if isinstance(timestamp, (int, float)):
                         age = current_time - timestamp
                         if age < CACHE_EXPIRY:
-                            logging.debug(f"{ticker} is fresh: age={age:.2f} seconds")
+                            analyze_logger.debug(f"{ticker} is fresh: age={age:.2f} seconds")
                             fresh_count += 1
                             is_fresh = True
                         else:
-                            logging.info(f"{ticker} is stale: age={age:.2f} seconds")
+                            analyze_logger.info(f"{ticker} is stale: age={age:.2f} seconds")
                             stale_count += 1
                             is_fresh = False
                     else:
-                        logging.info(f"{ticker} has invalid timestamp type: {type(timestamp)}")
+                        analyze_logger.info(f"{ticker} has invalid timestamp type: {type(timestamp)}")
                         invalid_timestamp_count += 1
                         is_fresh = False
                 else:
-                    logging.info(f"{ticker} not found in cache")
+                    analyze_logger.info(f"{ticker} not found in cache")
                     missing_count += 1
                     is_fresh = False
 
@@ -255,14 +302,14 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
                     "security_name": security_name
                 })
 
-        logging.info(f"Loaded {len(ticker_data)} tickers from {file_path} after filtering")
-        logging.info(f"Cache hit/miss summary: Hits={fresh_count}, Misses={len(ticker_data) - fresh_count} (Total={len(ticker_data)})")
+        analyze_logger.info(f"Loaded {len(ticker_data)} tickers from {file_path} after filtering")
+        analyze_logger.info(f"Cache hit/miss summary: Hits={fresh_count}, Misses={len(ticker_data) - fresh_count} (Total={len(ticker_data)})")
         return ticker_data
     except sqlite3.Error as e:
-        logging.error(f"Database error while loading tickers from {file_path}: {str(e)}")
+        analyze_logger.error(f"Database error while loading tickers from {file_path}: {str(e)}")
         return []
     except Exception as e:
-        logging.error(f"Error loading tickers from {file_path}: {str(e)}")
+        analyze_logger.error(f"Error loading tickers from {file_path}: {str(e)}")
         return []
     finally:
         conn.close()
@@ -273,23 +320,25 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
     Uses stable endpoints with appropriate parameters.
     """
     if not api_keys or all(not key for key in api_keys):
-        logging.error(f"No valid API keys provided for endpoint {endpoint}")
+        analyze_logger.error(f"No valid API keys provided for endpoint {endpoint}")
         return None
 
     for api_key in api_keys:
         if cancel_event and cancel_event.is_set():
-            logging.info(f"Cancelling fetch for {ticker} ({endpoint})")
+            analyze_logger.info(f"Cancelling fetch for {ticker} ({endpoint})")
             return None
 
         limiter = paid_rate_limiter if api_key == FMP_API_KEYS[0] else free_rate_limiter
 
         for attempt in range(retries):
-            logging.debug(f"Attempt {attempt + 1}/{retries} for {ticker} ({endpoint}) with key ending in {api_key[-4:]}")
+            analyze_logger.debug(f"Attempt {attempt + 1}/{retries} for {ticker} ({endpoint}) with key ending in {api_key[-4:]}")
             try:
                 await limiter.acquire()
                 if endpoint in ["income-statement", "balance-sheet-statement"]:
                     url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?period=annual&limit=10&apikey={api_key}"
                 elif endpoint == "historical-price-full/stock_dividend":
+                    url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?apikey={api_key}"
+                elif endpoint == "profile":
                     url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?apikey={api_key}"
                 else:
                     url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?apikey={api_key}"
@@ -297,7 +346,7 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
                     async with session.get(url) as response:
                         if response.status == 429:
                             if update_rate_limit:
-                                update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}, pausing")
+                                update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}")
                             await asyncio.sleep(60)
                             continue
                         elif response.status != 200:
@@ -305,51 +354,53 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
                         data = await response.json()
                         if not data:
                             raise ValueError("Empty response from API")
-                        logging.info(f"Successfully fetched {endpoint} data for {ticker}")
+                        analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker}")
                         return data
                 else:
                     async with aiohttp.ClientSession() as temp_session:
                         async with temp_session.get(url) as response:
                             if response.status == 429:
                                 if update_rate_limit:
-                                    update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}, pausing")
+                                    update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}")
                                 await asyncio.sleep(60)
+                                continue
                             elif response.status != 200:
                                 raise aiohttp.ClientError(f"API returned status {response.status}")
                             data = await response.json()
                             if not data:
                                 raise ValueError("Empty response from API")
-                            logging.info(f"Successfully fetched {endpoint} data for {ticker}")
+                            analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker}")
                             return data
             except aiohttp.ClientError as e:
-                logging.error(f"Network error for {ticker} ({endpoint}): {str(e)}")
+                analyze_logger.error(f"Network error for {ticker} ({endpoint}): {str(e)}")
                 if attempt < retries - 1:
                     await asyncio.sleep(min(60 * (attempt + 1), 300))
                 else:
                     break
             except json.JSONDecodeError:
-                logging.error(f"JSON decoding error for {ticker} ({endpoint})")
+                analyze_logger.error(f"JSON decoding error for {ticker} ({endpoint})")
                 break
             except ValueError as e:
-                logging.error(f"Data error for {ticker} ({endpoint}): {str(e)}")
+                analyze_logger.error(f"Data error for {ticker} ({endpoint}): {str(e)}")
                 break
-    logging.error(f"All attempts and keys exhausted for {ticker} ({endpoint})")
+    analyze_logger.error(f"All attempts and keys exhausted for {ticker} ({endpoint})")
     return None
 
-async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, cancel_event=None) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Dict]]]:
-    """Fetch core financial data from FMP: income statement, balance sheet, and dividends."""
+async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, cancel_event=None) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[Dict], Optional[List[Dict]]]:
+    """Fetch core financial data from FMP: income statement, balance sheet, dividends, and profile."""
     primary_key = keys[0]
     
     income_data = await fetch_with_multiple_keys_async(ticker, "income-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     balance_data = await fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     dividend_data = await fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
+    profile_data = await fetch_with_multiple_keys_async(ticker, "profile", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     
-    if not income_data or not balance_data or not dividend_data:
-        logging.error(f"FMP fetch failed for {ticker}: Incomplete data (Income: {bool(income_data)}, Balance: {bool(balance_data)}, Dividends: {bool(dividend_data)})")
-        return None, None, None
+    if not income_data or not balance_data or not dividend_data or not profile_data:
+        analyze_logger.error(f"FMP fetch failed for {ticker}: Incomplete data (Income: {bool(income_data)}, Balance: {bool(balance_data)}, Dividends: {bool(dividend_data)}, Profile: {bool(profile_data)})")
+        return None, None, None, None
     
-    logging.info(f"Successfully fetched FMP data for {ticker}")
-    return income_data, balance_data, dividend_data
+    analyze_logger.info(f"Successfully fetched FMP data for {ticker}")
+    return income_data, balance_data, dividend_data, profile_data
 
 async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit=None, cancel_event=None, income_data=None, balance_data=None, dividend_data=None) -> Tuple[List[float], List[float], List[float], List[float], List[int], Dict[str, float], List[Dict]]:
     """Process FMP data into historical financial metrics for Graham analysis using FMP dividends."""
@@ -361,26 +412,36 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     balance_data_list = []
 
     if not income_data or not balance_data or not dividend_data:
-        logging.error(f"No income, balance, or dividend data provided for {ticker}")
+        analyze_logger.error(f"No income, balance, or dividend data provided for {ticker}")
         return [], [], [], [], [], {}, []
 
     years_income = [int(entry['date'].split('-')[0]) for entry in income_data if 'date' in entry]
     years_balance = [int(entry['date'].split('-')[0]) for entry in balance_data if 'date' in entry]
-    years_available = sorted(set(years_income) & set(years_balance), reverse=True)[:10]
+    years_available = sorted(set(years_income) & set(years_balance))[:10]  # Ascending order (earliest to latest)
 
     if not years_available:
-        logging.error(f"No common years found for {ticker} between income and balance data")
+        analyze_logger.error(f"No common years found for {ticker} between income and balance data")
         return [], [], [], [], [], {}, []
 
-    div_dict = {}
-    for year in years_available:
-        div_dict[year] = 0.0
-    for div_entry in dividend_data:
-        if 'date' in div_entry and 'dividend' in div_entry:
-            div_year = int(div_entry['date'].split('-')[0])
-            if div_year in years_available:
-                div_dict[div_year] += float(div_entry['adjDividend'])
+    # Fetch dividend data correctly from 'historical' key
+    dividend_history = dividend_data.get('historical', [])
+    div_dict = {year: 0.0 for year in years_available}
+    for div_entry in dividend_history:
+        if 'date' in div_entry and 'adjDividend' in div_entry:
+            try:
+                div_year = int(div_entry['date'].split('-')[0])
+                adj_dividend = float(div_entry['adjDividend'])
+                if div_year in years_available:
+                    div_dict[div_year] += adj_dividend
+                    analyze_logger.debug(f"{ticker}: Added dividend {adj_dividend} for year {div_year}")
+            except (ValueError, TypeError) as e:
+                analyze_logger.warning(f"{ticker}: Invalid dividend entry {div_entry}: {str(e)}")
 
+    analyze_logger.debug(f"{ticker}: Dividend dictionary after processing: {div_dict}")
+    if not any(div_dict.values()):
+        analyze_logger.warning(f"No dividend data found for {ticker} in the available years")
+
+    # Process data for each year in ascending order
     for year in years_available:
         year_str = str(year)
         
@@ -409,7 +470,9 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
 
         balance_data_list.append(balance_entry)
 
-    logging.debug(f"Fetched data for {ticker}: ROE={len(roe_list)}, ROTC={len(rotc_list)}, EPS={len(eps_list)}, Div={len(div_list)}, Years={years_available}")
+    analyze_logger.debug(f"Fetched data for {ticker}: ROE={len(roe_list)}, ROTC={len(rotc_list)}, EPS={len(eps_list)}, Div={len(div_list)}, Years={years_available}")
+    analyze_logger.debug(f"{ticker}: EPS List: {eps_list}")
+    analyze_logger.debug(f"{ticker}: Dividend List: {div_list}")
     return roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list
 
 def calculate_cagr(start_value, end_value, years):
@@ -420,56 +483,56 @@ def calculate_cagr(start_value, end_value, years):
 def calculate_common_criteria(ticker: str, eps_list: List[float], div_list: List[float], revenue: Dict[str, float], balance_data: List[Dict], debt_to_equity: Optional[float], available_data_years: int, latest_revenue: float) -> Optional[int]:
     """Calculate Graham score with data validation (6 common criteria)."""
     if available_data_years < 10:
-        logging.warning(f"{ticker}: Insufficient data - {available_data_years} years")
+        analyze_logger.warning(f"{ticker}: Insufficient data - {available_data_years} years")
         return None
 
     if not balance_data or 'totalCurrentAssets' not in balance_data[0] or 'totalCurrentLiabilities' not in balance_data[0]:
-        logging.warning(f"Missing required balance sheet fields for {ticker}")
+        analyze_logger.warning(f"Missing required balance sheet fields for {ticker}")
         return None
 
     score = 0
 
     revenue_passed = latest_revenue >= 500_000_000
-    logging.debug(f"{ticker}: Revenue = ${latest_revenue / 1e6:.2f}M, Passed: {revenue_passed}")
+    analyze_logger.debug(f"{ticker}: Criterion 1 - Revenue >= $500M: {'Yes' if revenue_passed else 'No'} (${latest_revenue / 1e6:.2f}M)")
     if revenue_passed:
         score += 1
 
-    latest_balance = balance_data[0]
+    latest_balance = balance_data[-1]  # Latest year (ascending order)
     current_assets = float(latest_balance.get('totalCurrentAssets', 0))
     current_liabilities = float(latest_balance.get('totalCurrentLiabilities', 1))
     current_ratio = current_assets / current_liabilities if current_liabilities > 0 else 0
     current_passed = current_ratio > 2
-    logging.debug(f"{ticker}: Current Ratio = {current_ratio:.2f}, Passed: {current_passed}")
+    analyze_logger.debug(f"{ticker}: Criterion 2 - Current Ratio > 2: {'Yes' if current_passed else 'No'} ({current_ratio:.2f})")
     if current_passed:
         score += 1
 
     max_negative_years = min(2, available_data_years // 5)
     negative_eps_count = sum(1 for eps in eps_list if eps <= 0)
     stability_passed = negative_eps_count <= max_negative_years
-    logging.debug(f"{ticker}: Negative EPS years = {negative_eps_count}, Allowed: {max_negative_years}, Passed: {stability_passed}")
+    analyze_logger.debug(f"{ticker}: Criterion 3 - Earnings Stability (<= {max_negative_years} negative years): {'Yes' if stability_passed else 'No'} ({negative_eps_count} negatives, EPS List: {eps_list})")
     if stability_passed:
         score += 1
 
     dividend_passed = all(div > 0 for div in div_list)
-    logging.debug(f"{ticker}: Uninterrupted Dividends: {dividend_passed}")
+    analyze_logger.debug(f"{ticker}: Criterion 4 - Uninterrupted Dividends: {'Yes' if dividend_passed else 'No'} (Div List: {div_list})")
     if dividend_passed:
         score += 1
 
-    if eps_list[-1] > 0 and eps_list[0] > 0:
-        cagr = calculate_cagr(eps_list[-1], eps_list[0], available_data_years - 1)
+    if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
+        cagr = calculate_cagr(eps_list[0], eps_list[-1], available_data_years - 1)  # eps_list[0] is earliest, eps_list[-1] is latest
         growth_passed = cagr > 0.03
-        logging.debug(f"{ticker}: EPS CAGR = {cagr:.2%}, Passed: {growth_passed}")
+        analyze_logger.debug(f"{ticker}: Criterion 5 - EPS CAGR > 3%: {'Yes' if growth_passed else 'No'} ({cagr:.2%}, EPS List: {eps_list})")
         if growth_passed:
             score += 1
     else:
-        logging.debug(f"{ticker}: EPS CAGR not calculated (invalid EPS)")
+        analyze_logger.debug(f"{ticker}: Criterion 5 - EPS CAGR > 3%: No (invalid EPS), EPS List: {eps_list}")
 
     debt_passed = debt_to_equity is not None and debt_to_equity < 2
-    logging.debug(f"{ticker}: Debt-to-Equity = {debt_to_equity if debt_to_equity is not None else 'N/A'}, Passed: {debt_passed}")
+    analyze_logger.debug(f"{ticker}: Criterion 6 - Debt-to-Equity < 2: {'Yes' if debt_passed else 'No'} ({debt_to_equity if debt_to_equity is not None else 'N/A'})")
     if debt_passed:
         score += 1
 
-    logging.debug(f"{ticker}: Common Score = {score}/6 with {available_data_years} years of data")
+    analyze_logger.debug(f"{ticker}: Common Score = {score}/6 with {available_data_years} years of data")
     return score
 
 def calculate_graham_score_8(ticker: str, price: float, pe_ratio: Optional[float], pb_ratio: Optional[float], debt_to_equity: Optional[float], eps_list: List[float], div_list: List[float], revenue: Dict[str, float], balance_data: List[Dict], available_data_years: int, latest_revenue: float) -> int:
@@ -478,31 +541,42 @@ def calculate_graham_score_8(ticker: str, price: float, pe_ratio: Optional[float
     common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data, debt_to_equity, available_data_years, latest_revenue)
     if common_score is not None:
         score += common_score
+        analyze_logger.debug(f"{ticker}: Common Score (part of Graham 8) = {common_score}/6")
+    else:
+        analyze_logger.warning(f"{ticker}: Common score is None, setting to 0")
     if pe_ratio is not None and pe_ratio <= 15:
         score += 1
+        analyze_logger.debug(f"{ticker}: Criterion 7 - P/E Ratio <= 15: Passed (P/E = {pe_ratio})")
+    else:
+        analyze_logger.debug(f"{ticker}: Criterion 7 - P/E Ratio <= 15: Failed (P/E = {pe_ratio})")
     if pb_ratio is not None and pb_ratio <= 1.5:
         score += 1
-    logging.debug(f"{ticker}: Full Graham Score = {score}/8 with {available_data_years} years of data")
+        analyze_logger.debug(f"{ticker}: Criterion 8 - P/B Ratio <= 1.5: Passed (P/B = {pb_ratio})")
+    else:
+        analyze_logger.debug(f"{ticker}: Criterion 8 - P/B Ratio <= 1.5: Failed (P/B = {pb_ratio})")
+    analyze_logger.debug(f"{ticker}: Full Graham Score = {score}/8 with {available_data_years} years of data")
     return score
 
-def calculate_graham_value(earnings: Optional[float], eps_list: List[float] = None) -> float:
-    """Calculate Graham intrinsic value using Moody's AAA yield."""
+async def calculate_graham_value(earnings: Optional[float], stock_data: dict) -> float:
+    """Calculate Graham intrinsic value using Moody's AAA yield and sector growth rate with annual EPS."""
     if not earnings or earnings <= 0:
+        analyze_logger.warning(f"Invalid earnings for {stock_data['ticker']}: {earnings}")
         return float('nan')
     aaa_yield = get_aaa_yield(FRED_API_KEY)
     if aaa_yield <= 0:
-        logging.error("Moody's AAA yield is zero or negative.")
+        analyze_logger.error("Moody's AAA yield is zero or negative.")
         return float('nan')
-    growth_rate = 0.0
-    if eps_list and len(eps_list) >= 2 and eps_list[-1] > 0 and eps_list[0] > 0:
-        growth_rate = calculate_cagr(eps_list[-1], eps_list[0], len(eps_list) - 1)
-    g = growth_rate * 100
+    sector = stock_data.get('sector', 'Unknown')
+    g = get_sector_growth_rate(sector)
+    if g == 4.0 and sector != 'Unknown':
+        analyze_logger.debug(f"Using default growth rate 4.0% for sector '{sector}' as no specific rate found")
     normalization_factor = 4.4
     value = (earnings * (8.5 + 2 * g) * normalization_factor) / (100 * aaa_yield)
+    analyze_logger.debug(f"Calculated Graham value for {stock_data['ticker']}: EPS={earnings}, Sector={sector}, Growth={g}%, AAA Yield={aaa_yield}, Value={value}")
     return value
 
 async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, margin_of_safety=0.33, exchange="Stock", ticker_manager=None, update_rate_limit=None, cancel_event=None):
-    """Fetch data in batches, optimized for FMP API limits with YFinance for price during analysis."""
+    """Fetch data in batches: FMP during screening, YFinance price + cache during analysis."""
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -513,24 +587,6 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TICKERS)
     nyse_tickers = ticker_manager.get_tickers("NYSE")
     nasdaq_tickers = ticker_manager.get_tickers("NASDAQ")
-
-    # Fetch price and company info from YFinance only during analysis mode
-    prices = {}
-    company_info = {}
-    if not screening_mode:
-        for ticker in tickers:
-            try:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                if info is not None:
-                    company_info[ticker] = info
-                    prices[ticker] = info.get('regularMarketPrice', info.get('previousClose', 0))
-                else:
-                    logging.error(f"No info available for {ticker} from YFinance")
-                    error_tickers.append(ticker)
-            except Exception as e:
-                logging.error(f"Error fetching info for {ticker} from YFinance: {str(e)}")
-                error_tickers.append(ticker)
 
     def save_to_db(result):
         future = db_executor.submit(_save_to_db, result)
@@ -551,21 +607,24 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
             cursor.execute(
                 """INSERT OR REPLACE INTO stocks 
                    (ticker, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, 
-                    timestamp, company_name, debt_to_equity, eps_ttm, book_value_per_share, common_score, latest_revenue, available_data_years) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    timestamp, company_name, debt_to_equity, eps_ttm, book_value_per_share, 
+                    common_score, latest_revenue, available_data_years, sector, years) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result['ticker'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                 ",".join(map(str, result['roe_list'] if result['roe_list'] else [])),
-                 ",".join(map(str, result['rotc_list'] if result['rotc_list'] else [])),
-                 ",".join(map(str, result['eps_list'] if result['eps_list'] else [])),
-                 ",".join(map(str, result['div_list'] if result['div_list'] else [])),
-                 ticker_list_hash, json.dumps(result['balance_data']), result['timestamp'],
-                 result['company_name'], result['debt_to_equity'], result['eps_ttm'], result['book_value_per_share'],
-                 result['common_score'], result['latest_revenue'], result['available_data_years'])
+                 ",".join(map(str, result['roe_list'] if 'roe_list' in result else [])),
+                 ",".join(map(str, result['rotc_list'] if 'rotc_list' in result else [])),
+                 ",".join(map(str, result['eps_list'] if 'eps_list' in result else [])),
+                 ",".join(map(str, result['div_list'] if 'div_list' in result else [])),
+                 ticker_list_hash, json.dumps(result['balance_data'] if 'balance_data' in result else []),
+                 result['timestamp'], result['company_name'], result['debt_to_equity'],
+                 result['eps_ttm'], result['book_value_per_share'], result['common_score'],
+                 result['latest_revenue'], result['available_data_years'], result['sector'],
+                 ",".join(map(str, result['years'] if 'years' in result else [])))
             )
             conn.commit()
-            logging.info(f"Saved {result['ticker']} to database with hash {ticker_list_hash}")
+            analyze_logger.info(f"Saved {result['ticker']} to database with hash {ticker_list_hash}")
         except sqlite3.Error as e:
-            logging.error(f"Database error saving {result['ticker']}: {str(e)}")
+            analyze_logger.error(f"Database error saving {result['ticker']}: {str(e)}")
         finally:
             conn.close()
 
@@ -578,62 +637,87 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
             cached_data = get_stock_data_from_db(ticker)
             current_time = time.time()
 
-            if cached_data and cached_data['timestamp'] and current_time - cached_data['timestamp'] < CACHE_EXPIRY:
+            # Modified cache check to include 'years'
+            if cached_data and cached_data['timestamp'] and (current_time - cached_data['timestamp'] < CACHE_EXPIRY) and cached_data.get('years'):
+                analyze_logger.debug(f"Cache hit for {ticker}: Years={cached_data['years']}")
                 if screening_mode:
                     return {
                         "ticker": ticker,
                         "exchange": ticker_exchange,
                         "company_name": cached_data['company_name'],
                         "common_score": cached_data['common_score'],
-                        "available_data_years": cached_data['available_data_years']
+                        "available_data_years": cached_data['available_data_years'],
+                        "sector": cached_data['sector']
                     }
-                elif not screening_mode:
-                    price = prices.get(ticker, None)
-                    if price is None:
-                        logging.error(f"No price data for {ticker} from YFinance")
-                        return {"ticker": ticker, "exchange": ticker_exchange, "error": "No price data from YFinance"}
+                else:
+                    # Fetch price from Yahoo Finance for analysis mode
+                    try:
+                        stock = yf.Ticker(ticker)
+                        info = stock.info
+                        price = info.get('regularMarketPrice', info.get('previousClose', None))
+                        if price is None:
+                            analyze_logger.error(f"No price data for {ticker} from YFinance")
+                            return {"ticker": ticker, "exchange": ticker_exchange, "error": "No price data from YFinance"}
+                    except Exception as e:
+                        analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
+                        return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+
                     pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] > 0 else None
                     pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] > 0 else None
-                    intrinsic_value = calculate_graham_value(cached_data['eps_ttm'], cached_data['eps']) if cached_data['eps_ttm'] else float('nan')
+                    intrinsic_value = await calculate_graham_value(cached_data['eps_ttm'], cached_data) if cached_data['eps_ttm'] else float('nan')
                     buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
                     sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
-                    graham_score = calculate_graham_score_8(ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
-                                                            cached_data['eps'], cached_data['dividend'], {},
-                                                            cached_data['balance_data'], cached_data['available_data_years'],
-                                                            cached_data['latest_revenue'])
+                    # Reconstruct revenue dictionary using years and latest_revenue
+                    revenue = {}
+                    if cached_data['years'] and cached_data['latest_revenue']:
+                        revenue[str(cached_data['years'][-1])] = cached_data['latest_revenue']
+                    # Ensure historical data lists are aligned with years (ascending order)
+                    graham_score = calculate_graham_score_8(
+                        ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
+                        cached_data['eps_list'], cached_data['div_list'], revenue,
+                        cached_data['balance_data'], cached_data['available_data_years'],
+                        cached_data['latest_revenue']
+                    )
                     result = {
                         "ticker": ticker,
                         "exchange": ticker_exchange,
                         "company_name": cached_data['company_name'],
                         "price": price,
                         "common_score": cached_data['common_score'],
-                        "roe_list": cached_data['roe'],
-                        "rotc_list": cached_data['rotc'],
-                        "eps_list": cached_data['eps'],
-                        "div_list": cached_data['dividend'],
+                        "graham_score": graham_score,
+                        "roe_list": cached_data['roe_list'],
+                        "rotc_list": cached_data['rotc_list'],
+                        "eps_list": cached_data['eps_list'],
+                        "div_list": cached_data['div_list'],
                         "years": cached_data.get('years', []),
                         "balance_data": cached_data['balance_data'],
                         "available_data_years": cached_data['available_data_years'],
                         "latest_revenue": cached_data['latest_revenue'],
                         "debt_to_equity": cached_data['debt_to_equity'],
-                        "eps_ttm": cached_data['eps_ttm'],
+                        "eps_ttm": cached_data['eps_ttm'],  # Now latest annual EPS
                         "book_value_per_share": cached_data['book_value_per_share'],
                         "pe_ratio": pe_ratio,
                         "pb_ratio": pb_ratio,
                         "intrinsic_value": intrinsic_value,
                         "buy_price": buy_price,
                         "sell_price": sell_price,
-                        "graham_score": graham_score
+                        "sector": cached_data['sector']
                     }
                     return result
+            else:
+                if cached_data and not cached_data.get('years'):
+                    analyze_logger.warning(f"Cache for {ticker} missing 'years', refetching data")
+
+            # If cache miss or invalid, fetch from FMP (only during screening)
+            if not screening_mode:
+                analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
+                return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
 
             await asyncio.sleep(DELAY_BETWEEN_CALLS)
             security_name = ticker_manager.get_security_name(ticker)
-            price = prices.get(ticker, None) if not screening_mode else None
-            company_name = company_info.get(ticker, {}).get('longName', security_name) if not screening_mode else security_name
-
-            income_data, balance_data, dividend_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
-            if not income_data or not balance_data or not dividend_data:
+            
+            income_data, balance_data, dividend_data, profile_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
+            if not income_data or not balance_data or not dividend_data or not profile_data:
                 missing = []
                 if not income_data:
                     missing.append("income_data")
@@ -641,24 +725,28 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                     missing.append("balance_data")
                 if not dividend_data:
                     missing.append("dividend_data")
-                logging.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
+                if not profile_data:
+                    missing.append("profile_data")
+                analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
                 return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
 
-            latest_income = income_data[0] if income_data else {}
+            company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
+            sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
+
             latest_balance = balance_data[0] if balance_data else {}
-            shares_outstanding = float(latest_income.get('weightedAverageShsOut', 1))
-            net_income = float(latest_income.get('netIncome', 0))
-            eps_ttm = net_income / shares_outstanding if shares_outstanding > 0 else 0
             shareholder_equity = float(latest_balance.get('totalStockholdersEquity', 1))
-            book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding > 0 else 0
             long_term_debt = float(latest_balance.get('longTermDebt', 0))
             debt_to_equity = long_term_debt / shareholder_equity if shareholder_equity != 0 else None
+            shares_outstanding = float(income_data[0].get('weightedAverageShsOut', 1)) if income_data else 1
+            book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding > 0 else 0
 
             roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list = await fetch_historical_data(
                 ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data
             )
             available_data_years = len(years_available)
-            latest_revenue = revenue.get(str(years_available[0]) if years_available else '', 0)
+            latest_revenue = revenue.get(str(years_available[-1]) if years_available else '', 0)  # Latest year
+            # Use latest annual EPS instead of calculating eps_ttm
+            eps_ttm = eps_list[-1] if eps_list else 0  # Latest annual EPS
             common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data_list, debt_to_equity, available_data_years, latest_revenue)
 
             full_result = {
@@ -669,41 +757,26 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                 "rotc_list": rotc_list,
                 "eps_list": eps_list,
                 "div_list": div_list,
-                "years": years_available,
+                "years": years_available,  # Ensure this is included
                 "balance_data": balance_data_list,
                 "available_data_years": available_data_years,
                 "latest_revenue": latest_revenue,
                 "debt_to_equity": debt_to_equity,
-                "eps_ttm": eps_ttm,
+                "eps_ttm": eps_ttm,  # Now latest annual EPS
                 "book_value_per_share": book_value_per_share,
                 "timestamp": time.time(),
-                "common_score": common_score
+                "common_score": common_score,
+                "sector": sector
             }
 
-            if not screening_mode and price is not None:
-                pe_ratio = price / eps_ttm if eps_ttm > 0 else None
-                pb_ratio = price / book_value_per_share if book_value_per_share > 0 else None
-                intrinsic_value = calculate_graham_value(eps_ttm, eps_list) if eps_ttm else float('nan')
-                buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
-                sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
-                graham_score = calculate_graham_score_8(ticker, price, pe_ratio, pb_ratio, debt_to_equity, eps_list, div_list, revenue, balance_data_list, available_data_years, latest_revenue)
-                full_result.update({
-                    "price": price,
-                    "pe_ratio": pe_ratio,
-                    "pb_ratio": pb_ratio,
-                    "intrinsic_value": intrinsic_value,
-                    "buy_price": buy_price,
-                    "sell_price": sell_price,
-                    "graham_score": graham_score
-                })
-
             save_to_db(full_result)
-            return full_result if not screening_mode else {
+            return {
                 "ticker": ticker,
                 "exchange": ticker_exchange,
                 "company_name": company_name,
                 "common_score": common_score,
-                "available_data_years": available_data_years
+                "available_data_years": available_data_years,
+                "sector": sector
             }
 
     for ticker in tickers:
@@ -712,14 +785,14 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
     try:
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=600)
     except asyncio.TimeoutError:
-        logging.error("Timeout while fetching batch data")
+        analyze_logger.error("Timeout while fetching batch data")
         results = []
 
     error_tickers = [ticker for ticker, result in zip(tickers, results) if isinstance(result, dict) and 'error' in result]
     valid_results = [r for r in results if isinstance(r, dict) and 'error' not in r]
 
     if error_tickers:
-        logging.info(f"Error tickers during batch fetch: {error_tickers}")
+        analyze_logger.info(f"Error tickers during batch fetch: {error_tickers}")
 
     return valid_results, error_tickers
 
@@ -728,7 +801,7 @@ async def fetch_stock_data(ticker, expected_return=0.0, margin_of_safety=0.33, e
         [ticker], False, expected_return, margin_of_safety, exchange, ticker_manager, update_rate_limit, cancel_event
     )
     if not results or 'error' in results[0]:
-        logging.error(f"Failed to fetch data for {ticker}")
+        analyze_logger.error(f"Failed to fetch data for {ticker}")
         raise ValueError(f"Failed to fetch data for {ticker}")
     return results[0]
 
@@ -742,7 +815,7 @@ async def save_qualifying_stocks_to_favorites(qualifying_stocks, exchange):
         favorites[list_name] = qualifying_stocks
         with open(FAVORITES_FILE, 'w') as f:
             json.dump(favorites, f, indent=4)
-    logging.info(f"Saved qualifying stocks to {list_name}")
+    analyze_logger.info(f"Saved qualifying stocks to {list_name}")
     return list_name
 
 def load_favorites():
@@ -751,7 +824,7 @@ def load_favorites():
             with open(FAVORITES_FILE, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            logging.error(f"Error loading favorites: {str(e)}")
+            analyze_logger.error(f"Error loading favorites: {str(e)}")
     return {}
 
 def get_stock_data_from_db(ticker):
@@ -762,35 +835,55 @@ def get_stock_data_from_db(ticker):
         if row:
             columns = [desc[0] for desc in cursor.description]
             stock_dict = dict(zip(columns, row))
-            return {
+            years = [int(y) for y in stock_dict['years'].split(",")] if stock_dict.get('years') else []
+            if not years:
+                analyze_logger.warning(f"No years data found for {ticker} in database")
+            roe_list = [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else []
+            rotc_list = [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else []
+            eps_list = [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else []
+            div_list = [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else []
+            # Ensure lists are aligned with years (ascending order)
+            if years:
+                data = list(zip(years, roe_list, rotc_list, eps_list, div_list))
+                data.sort(key=lambda x: x[0])  # Sort by year (ascending)
+                years, roe_list, rotc_list, eps_list, div_list = zip(*data)
+                years = list(years)
+                roe_list = list(roe_list)
+                rotc_list = list(rotc_list)
+                eps_list = list(eps_list)
+                div_list = list(div_list)
+            result = {
                 "ticker": stock_dict['ticker'],
                 "date": stock_dict['date'],
-                "roe": [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else [],
-                "rotc": [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else [],
-                "eps": [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else [],
-                "dividend": [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else [],
-                "ticker_list_hash": stock_dict['ticker_list_hash'],
+                "roe_list": roe_list,
+                "rotc_list": rotc_list,
+                "eps_list": eps_list,
+                "div_list": div_list,
+                "years": years,
                 "balance_data": json.loads(stock_dict['balance_data']) if stock_dict['balance_data'] else [],
                 "timestamp": stock_dict['timestamp'],
                 "company_name": stock_dict['company_name'],
                 "debt_to_equity": stock_dict['debt_to_equity'],
-                "eps_ttm": stock_dict['eps_ttm'],
+                "eps_ttm": stock_dict['eps_ttm'],  # Now latest annual EPS
                 "book_value_per_share": stock_dict['book_value_per_share'],
                 "common_score": stock_dict['common_score'],
                 "latest_revenue": stock_dict['latest_revenue'],
-                "available_data_years": stock_dict['available_data_years']
+                "available_data_years": stock_dict['available_data_years'],
+                "sector": stock_dict.get('sector', 'Unknown')
             }
+            analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}")
+            return result
         return None
     except sqlite3.Error as e:
-        logging.error(f"Database error fetching {ticker}: {str(e)}")
+        analyze_logger.error(f"Database error fetching {ticker}: {str(e)}")
         return None
     finally:
         conn.close()
 
-async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
+async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
     """Screen NYSE stocks with performance optimizations and selective logging."""
     exchange = "NYSE"
-    logging.info(f"Starting NYSE Graham screening with {len(tickers) if tickers else 'all'} tickers")
+    screening_logger.info(f"Starting NYSE Graham screening with {len(tickers) if tickers else 'all'} tickers")
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -803,7 +896,7 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
         row = cursor.fetchone()
         stored_hash = row[0] if row else None
         if stored_hash != current_file_hash:
-            logging.info(f"New version of {file_path} detected. Resetting data.")
+            screening_logger.info(f"New version of {file_path} detected. Resetting data.")
             cursor.execute("DELETE FROM screening_progress WHERE exchange=?", (exchange,))
             cursor.execute("DELETE FROM stocks WHERE ticker_list_hash != ?", (current_file_hash,))
             cursor.execute("DELETE FROM graham_qualifiers WHERE exchange=?", (exchange,))
@@ -814,7 +907,6 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        # Exclude invalid tickers from NYSE screening
         invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
@@ -822,7 +914,7 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
         else:
             invalid_tickers = set()
         valid_tickers = [t for t in ticker_list if t not in invalid_tickers]
-        logging.info(f"Excluding {len(ticker_list) - len(valid_tickers)} invalid NYSE tickers")
+        screening_logger.info(f"Excluding {len(ticker_list) - len(valid_tickers)} invalid NYSE tickers")
 
         qualifying_stocks, common_scores, exchanges = [], [], []
         total_tickers = len(valid_tickers)
@@ -830,13 +922,12 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
         passed_tickers = 0
         error_tickers = []
 
-        # Dynamic sampling rate: ~2% of tickers, minimum 10
         sample_interval = max(10, total_tickers // 50)
 
-        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 3))
+        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 4))  # 4 calls/ticker
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
-                logging.info("Screening cancelled by user")
+                screening_logger.info("Screening cancelled by user")
                 break
             batch_start = time.time()
             batch = valid_tickers[i:i + dynamic_batch_size]
@@ -844,29 +935,28 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
             error_tickers.extend(batch_error_tickers)
             for result in batch_results:
                 ticker = result['ticker']
-                # Selective logging: first 10, dynamic middle sample, last 10
                 log_full = (processed_tickers < 10) or (processed_tickers >= total_tickers - 10) or (processed_tickers % sample_interval == 0)
                 
                 if 'error' in result:
                     if log_full:
-                        logging.warning(f"Skipping {ticker} due to error: {result['error']}")
+                        screening_logger.warning(f"Skipping {ticker} due to error: {result['error']}")
                     continue
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
                 if available_data_years >= 10 and common_score is not None and common_score >= 5:
                     if log_full:
-                        logging.info(f"{ticker}: Qualified with score {common_score}/6")
+                        screening_logger.info(f"{ticker}: Qualified with score {common_score}/6")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
                     cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'Unknown', result['exchange']))
+                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
                 else:
                     if log_full:
                         reason = "Insufficient data years" if available_data_years < 10 else "Low score" if common_score is not None else "No score calculated"
-                        logging.info(f"{ticker}: Disqualified - {reason}")
+                        screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
                 progress = (processed_tickers / total_tickers) * 100
@@ -878,9 +968,8 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
                 cursor.execute("INSERT OR REPLACE INTO screening_progress (exchange, ticker, timestamp, file_hash, status) VALUES (?, ?, ?, ?, ?)",
                                (exchange, ticker, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_file_hash, "completed"))
                 conn.commit()
-            logging.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
+            screening_logger.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
 
-        # Update NYSE Invalid Tickers file with new error tickers
         if error_tickers:
             invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
             if os.path.exists(invalid_file):
@@ -888,30 +977,29 @@ async def screen_nyse_graham_stocks(batch_size=25, cancel_event=None, tickers=No
                     existing_invalid = set(f.read().splitlines())
             else:
                 existing_invalid = set()
-            new_invalid = set(error_tickers) - existing_invalid  # Only add new unique tickers
+            new_invalid = set(error_tickers) - existing_invalid
             if new_invalid:
                 with open(invalid_file, 'a') as f:
                     for ticker in sorted(new_invalid):
                         f.write(ticker + '\n')
-                logging.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
+                screening_logger.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
 
-        # Log summary
-        logging.info(f"Completed NYSE screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
-        if error_tickers and total_tickers <= 20:  # Full list if small
-            logging.info(f"Error tickers: {error_tickers}")
+        screening_logger.info(f"Completed NYSE screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
+        if error_tickers and total_tickers <= 20:
+            screening_logger.info(f"Error tickers: {error_tickers}")
         elif error_tickers:
             sample_size = min(5, len(error_tickers))
             error_sample = random.sample(error_tickers, sample_size)
-            logging.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
+            screening_logger.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
 
         return qualifying_stocks, common_scores, exchanges, error_tickers
     finally:
         conn.close()
 
-async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
+async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
     """Screen NASDAQ stocks with performance optimizations and selective logging."""
     exchange = "NASDAQ"
-    logging.info(f"Starting NASDAQ Graham screening with {len(tickers) if tickers else 'all'} tickers")
+    screening_logger.info(f"Starting NASDAQ Graham screening with {len(tickers) if tickers else 'all'} tickers")
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -924,7 +1012,7 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
         row = cursor.fetchone()
         stored_hash = row[0] if row else None
         if stored_hash != current_file_hash:
-            logging.info(f"New version of {file_path} detected. Resetting data.")
+            screening_logger.info(f"New version of {file_path} detected. Resetting data.")
             cursor.execute("DELETE FROM screening_progress WHERE exchange=?", (exchange,))
             cursor.execute("DELETE FROM stocks WHERE ticker_list_hash != ?", (current_file_hash,))
             cursor.execute("DELETE FROM graham_qualifiers WHERE exchange=?", (exchange,))
@@ -935,7 +1023,6 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        # Exclude invalid tickers from NASDAQ screening
         invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
@@ -943,7 +1030,7 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
         else:
             invalid_tickers = set()
         valid_tickers = [t for t in ticker_list if t not in invalid_tickers]
-        logging.info(f"Excluding {len(ticker_list) - len(valid_tickers)} invalid NASDAQ tickers")
+        screening_logger.info(f"Excluding {len(ticker_list) - len(valid_tickers)} invalid NASDAQ tickers")
 
         qualifying_stocks, common_scores, exchanges = [], [], []
         total_tickers = len(valid_tickers)
@@ -951,13 +1038,12 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
         passed_tickers = 0
         error_tickers = []
 
-        # Dynamic sampling rate: ~2% of tickers, minimum 10
         sample_interval = max(10, total_tickers // 50)
 
-        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 3))
+        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 4))  # 4 calls/ticker
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
-                logging.info("Screening cancelled by user")
+                screening_logger.info("Screening cancelled by user")
                 break
             batch_start = time.time()
             batch = valid_tickers[i:i + dynamic_batch_size]
@@ -965,29 +1051,28 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
             error_tickers.extend(batch_error_tickers)
             for result in batch_results:
                 ticker = result['ticker']
-                # Selective logging: first 10, dynamic middle sample, last 10
                 log_full = (processed_tickers < 10) or (processed_tickers >= total_tickers - 10) or (processed_tickers % sample_interval == 0)
                 
                 if 'error' in result:
                     if log_full:
-                        logging.warning(f"Skipping {ticker} due to error: {result['error']}")
+                        screening_logger.warning(f"Skipping {ticker} due to error: {result['error']}")
                     continue
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
                 if available_data_years >= 10 and common_score is not None and common_score >= 5:
                     if log_full:
-                        logging.info(f"{ticker}: Qualified with score {common_score}/6")
+                        screening_logger.info(f"{ticker}: Qualified with score {common_score}/6")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
                     cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'Unknown', result['exchange']))
+                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
                 else:
                     if log_full:
                         reason = "Insufficient data years" if available_data_years < 10 else "Low score" if common_score is not None else "No score calculated"
-                        logging.info(f"{ticker}: Disqualified - {reason}")
+                        screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
                 progress = (processed_tickers / total_tickers) * 100
@@ -999,9 +1084,8 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
                 cursor.execute("INSERT OR REPLACE INTO screening_progress (exchange, ticker, timestamp, file_hash, status) VALUES (?, ?, ?, ?, ?)",
                                (exchange, ticker, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_file_hash, "completed"))
                 conn.commit()
-            logging.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
+            screening_logger.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
 
-        # Update NASDAQ Invalid Tickers file with new error tickers
         if error_tickers:
             invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
             if os.path.exists(invalid_file):
@@ -1009,28 +1093,27 @@ async def screen_nasdaq_graham_stocks(batch_size=25, cancel_event=None, tickers=
                     existing_invalid = set(f.read().splitlines())
             else:
                 existing_invalid = set()
-            new_invalid = set(error_tickers) - existing_invalid  # Only add new unique tickers
+            new_invalid = set(error_tickers) - existing_invalid
             if new_invalid:
                 with open(invalid_file, 'a') as f:
                     for ticker in sorted(new_invalid):
                         f.write(ticker + '\n')
-                logging.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
+                screening_logger.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
 
-        # Log summary
-        logging.info(f"Completed NASDAQ screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
-        if error_tickers and total_tickers <= 20:  # Full list if small
-            logging.info(f"Error tickers: {error_tickers}")
+        screening_logger.info(f"Completed NASDAQ screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
+        if error_tickers and total_tickers <= 20:
+            screening_logger.info(f"Error tickers: {error_tickers}")
         elif error_tickers:
             sample_size = min(5, len(error_tickers))
             error_sample = random.sample(error_tickers, sample_size)
-            logging.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
+            screening_logger.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
 
         return qualifying_stocks, common_scores, exchanges, error_tickers
     finally:
         conn.close()
 
 def clear_in_memory_caches():
-    logging.info("No in-memory caches to clear (relying solely on SQLite database)")
+    analyze_logger.info("No in-memory caches to clear (relying solely on SQLite database)")
 
 if __name__ == "__main__":
     test_tickers = [{"ticker": "IBM"}, {"ticker": "JPM"}, {"ticker": "KO"}]

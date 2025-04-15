@@ -33,17 +33,37 @@ MAX_CALLS_PER_MINUTE_FREE = 5
 class FileHashError(Exception):
     pass
 
-# Logging setup with daily rotation
-log_file = os.path.join(DATA_DIR, 'nyse_graham_screen.log')
-handler = logging.handlers.TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7)  # Rotate daily, keep 7 backups
-handler.setLevel(logging.DEBUG)  # Capture all levels to file
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
+# Screening logger setup with size-based rotation
+screening_log_file = os.path.join(DATA_DIR, 'screening.log')
+screening_handler = logging.handlers.RotatingFileHandler(
+    screening_log_file, maxBytes=10*1024*1024, backupCount=5
+)
+screening_handler.setLevel(logging.INFO)  # Set to INFO to reduce log size
+screening_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+screening_handler.setFormatter(screening_formatter)
+screening_logger = logging.getLogger('screening')
+screening_logger.addHandler(screening_handler)
+screening_logger.setLevel(logging.DEBUG)  # Logger level remains DEBUG
+screening_logger.propagate = False
 
-logging.basicConfig(handlers=[handler], level=logging.INFO)  # Default to INFO for production
+# Analyze logger setup with size-based rotation
+analyze_log_file = os.path.join(DATA_DIR, 'analyze.log')
+analyze_handler = logging.handlers.RotatingFileHandler(
+    analyze_log_file, maxBytes=10*1024*1024, backupCount=5
+)
+analyze_handler.setLevel(logging.INFO)  # Set to INFO to reduce log size
+analyze_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+analyze_handler.setFormatter(analyze_formatter)
+analyze_logger = logging.getLogger('analyze')
+analyze_logger.addHandler(analyze_handler)
+analyze_logger.setLevel(logging.DEBUG)  # Logger level remains DEBUG
+analyze_logger.propagate = False
+
+# Console handler for development
 console = logging.StreamHandler()
-console.setLevel(logging.DEBUG)  # Console can show DEBUG for development
-logging.getLogger().addHandler(console)
+console.setLevel(logging.DEBUG)
+screening_logger.addHandler(console)
+analyze_logger.addHandler(console)
 
 def get_file_hash(file_path: str) -> str:
     try:
