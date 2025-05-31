@@ -5,10 +5,10 @@ import hashlib
 import aiohttp
 import asyncio
 from config import (CACHE_DB, NYSE_TICKERS_FILE, NASDAQ_TICKERS_FILE, FAVORITES_FILE,
-                   FMP_API_KEYS, ALPHA_VANTAGE_API_KEYS, CACHE_EXPIRY, BASE_DIR)
+                   FMP_API_KEYS, ALPHA_VANTAGE_API_KEYS, CACHE_EXPIRY, USER_DATA_DIR)
 
 # Logging setup (consistent with config.py)
-logging.basicConfig(filename=os.path.join(BASE_DIR, 'nyse_graham_screen.log'), level=logging.DEBUG,
+logging.basicConfig(filename=os.path.join(USER_DATA_DIR, 'nyse_graham_screen.log'), level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 console = logging.StreamHandler()
 console.setLevel(logging.DEBUG)

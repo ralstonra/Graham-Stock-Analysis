@@ -17,7 +17,10 @@ from graham_data import (screen_nasdaq_graham_stocks, screen_nyse_graham_stocks,
                          calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
                          clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db,
                          get_sector_growth_rate, calculate_cagr)
-from config import BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, CACHE_EXPIRY, screening_logger, analyze_logger
+from config import (
+    BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, 
+    CACHE_EXPIRY, screening_logger, analyze_logger, USER_DATA_DIR
+)
 import queue
 import shutil
 import requests
@@ -128,20 +131,33 @@ class GrahamScreeningApp:
         self.favorite_menu.bind('<<ComboboxSelected>>', load_favorite)
 
         def save_favorite():
+            print("Save Favorite button clicked")  # Debug
+            # Ensure TickerManager is initialized
+            self.task_queue.put(self.ticker_manager.initialize())
+            time.sleep(1)  # Wait for initialization (adjust if needed)
+            print(f"NYSE tickers: {len(self.ticker_manager.nyse_tickers)}, NASDAQ tickers: {len(self.ticker_manager.nasdaq_tickers)}")  # Debug
+            tickers_input = self.entry.get()
+            print(f"Input: {tickers_input}")  # Debug
             if not self.validate_tickers():
                 messagebox.showwarning("Invalid Tickers", "No valid tickers entered.")
                 return
             name = simpledialog.askstring("Save Favorite", "Enter list name:")
-            if name and self.entry.get().strip():
-                tickers = self.parse_tickers(self.entry.get())
+            print(f"List name: {name}")  # Debug
+            if not name or not name.strip():
+                messagebox.showwarning("Invalid Name", "Please enter a valid list name.")
+                return
+            if name and tickers_input.strip():
+                tickers = self.parse_tickers(tickers_input)
+                print(f"Parsed tickers: {tickers}")  # Debug
                 valid_tickers = [t for t in tickers if self.ticker_manager.is_valid_ticker(t)]
+                print(f"Valid tickers: {valid_tickers}")  # Debug
                 if not valid_tickers:
                     messagebox.showwarning("Invalid Tickers", "No valid NYSE or NASDAQ tickers.")
                     return
                 self.favorites[name] = valid_tickers
                 self.save_favorites()
-                self.favorite_menu['values'] = list(self.favorites.keys())
-                self.favorite_var.set(name)
+                self.refresh_favorites_dropdown(name)
+                print(f"Saved favorites: {self.favorites}")  # Debug
 
         ttk.Button(self.left_frame, text="Save Favorite", command=save_favorite).grid(row=6, column=0, pady=2, sticky="ew")
         ttk.Button(self.left_frame, text="Manage Favorites", command=self.manage_favorites).grid(row=7, column=0, pady=2, sticky="ew")
@@ -546,8 +562,8 @@ class GrahamScreeningApp:
     async def analyze_multiple_stocks_async(self, tickers):
         analyze_logger.info(f"Starting analysis for tickers: {tickers}")
 
-        nyse_invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
-        nasdaq_invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
+        nyse_invalid_file = os.path.join(USER_DATA_DIR, "NYSE Invalid Tickers.txt")
+        nasdaq_invalid_file = os.path.join(USER_DATA_DIR, "NASDAQ Invalid Tickers.txt")
         invalid_tickers = set()
         for invalid_file in [nyse_invalid_file, nasdaq_invalid_file]:
             if os.path.exists(invalid_file):
@@ -808,10 +824,9 @@ class GrahamScreeningApp:
             else:
                 self.safe_insert(self.metrics_text, "2. Current Ratio > 2: No (Missing data)\n")
 
-            max_negative_years = min(2, available_data_years // 5)
             negative_eps_count = sum(1 for eps in eps_list if eps <= 0)
-            stability_passed = negative_eps_count <= max_negative_years
-            self.safe_insert(self.metrics_text, f"3. Earnings Stability (<= {max_negative_years} negative years): {'Yes' if stability_passed else 'No'} ({negative_eps_count} negatives)\n")
+            stability_passed = negative_eps_count == 0
+            self.safe_insert(self.metrics_text, f"3. All Positive EPS: {'Yes' if stability_passed else 'No'} (Negative EPS years: {negative_eps_count})\n")
 
             dividend_passed = all(div > 0 for div in div_list) if div_list else False
             div_display = f" (Dividends: {', '.join(f'{d:.2f}' for d in div_list)})" if div_list else ""
@@ -1021,7 +1036,7 @@ class GrahamScreeningApp:
             "1. Enter tickers in the left column (e.g., AOS, AAPL) and click 'Analyze Stocks'.\n"
             "2. Use 'Save Favorite' to store ticker lists and 'Manage Favorites' to edit them.\n"
             "3. Adjust Margin of Safety and Expected Return using sliders.\n"
-            "4. Run NYSE or NASDAQ screenings via checkboxes and buttons in the middle/right columns.\n"
+            "4. Run NYSE or NASDAQ screenings via checkboxes and buttons in the middle/right columns. Stocks must meet all 6 Graham criteria to qualify.\n"
             "5. View results in the treeview below; select a stock to see historical data and metrics.\n"
             "6. Export qualifying stocks to CSV using the export buttons.\n"
             "7. Clear cache to refresh all data.\n"
@@ -1076,7 +1091,6 @@ class GrahamScreeningApp:
                     return
             await self.ticker_manager.initialize()
             self.root.after(0, lambda: messagebox.showinfo("Update Complete", "Ticker files updated successfully."))
-            self.root.after(0, lambda: self.entry.config(values=list(self.ticker_manager.get_tickers("NYSE") | self.ticker_manager.get_tickers("NASDAQ"))))
         self.task_queue.put(async_update())
 
     def on_closing(self):

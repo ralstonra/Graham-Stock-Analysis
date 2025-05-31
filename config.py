@@ -7,26 +7,27 @@ import threading
 import hashlib
 import logging.handlers
 
-# Base directory
+# Base directory (remains on OneDrive, where scripts are located)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
 
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# Local user data directory (on each user's computer)
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), "Graham Stock Analysis")
+if not os.path.exists(USER_DATA_DIR):
+    os.makedirs(USER_DATA_DIR)
 
-CACHE_DB = os.path.join(DATA_DIR, "api_cache.db")
-NYSE_TICKERS_FILE = os.path.join(DATA_DIR, "nyse_tickers.pkl")
-NASDAQ_TICKERS_FILE = os.path.join(DATA_DIR, "nasdaq_tickers.pkl")
-FAVORITES_FILE = os.path.join(DATA_DIR, "stock_favorites.json")
-NYSE_LIST_FILE = os.path.join(DATA_DIR, "otherlisted.txt")
-NASDAQ_LIST_FILE = os.path.join(DATA_DIR, "nasdaqlisted.txt")
+# Associated file paths (now local)
+CACHE_DB = os.path.join(USER_DATA_DIR, "api_cache.db")
+NYSE_LIST_FILE = os.path.join(USER_DATA_DIR, "otherlisted.txt")
+NASDAQ_LIST_FILE = os.path.join(USER_DATA_DIR, "nasdaqlisted.txt")
+FAVORITES_FILE = os.path.join(USER_DATA_DIR, "stock_favorites.json")
+screening_log_file = os.path.join(USER_DATA_DIR, "screening.log")
+analyze_log_file = os.path.join(USER_DATA_DIR, "analyze.log")
+
+# API keys and constants (unchanged)
 FMP_API_KEYS = ["PhsBX3X3LzaW8tUlOSJfMnX9GJUqXmH8", "cZhYea4KCtMopxUvDdeN1HQMMfHgat91"]
 FRED_API_KEY = "d28d895f1f3837fc6b9415baa3ce6061"
-
 CACHE_EXPIRY = 365 * 24 * 60 * 60
-
 FAVORITES_LOCK = threading.Lock()
-
 MAX_CALLS_PER_MINUTE_PAID = 300
 MAX_CALLS_PER_MINUTE_FREE = 5
 
@@ -34,29 +35,27 @@ class FileHashError(Exception):
     pass
 
 # Screening logger setup with size-based rotation
-screening_log_file = os.path.join(DATA_DIR, 'screening.log')
 screening_handler = logging.handlers.RotatingFileHandler(
     screening_log_file, maxBytes=10*1024*1024, backupCount=5
 )
-screening_handler.setLevel(logging.INFO)  # Set to INFO to reduce log size
+screening_handler.setLevel(logging.INFO)
 screening_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 screening_handler.setFormatter(screening_formatter)
 screening_logger = logging.getLogger('screening')
 screening_logger.addHandler(screening_handler)
-screening_logger.setLevel(logging.DEBUG)  # Logger level remains DEBUG
+screening_logger.setLevel(logging.DEBUG)
 screening_logger.propagate = False
 
 # Analyze logger setup with size-based rotation
-analyze_log_file = os.path.join(DATA_DIR, 'analyze.log')
 analyze_handler = logging.handlers.RotatingFileHandler(
     analyze_log_file, maxBytes=10*1024*1024, backupCount=5
 )
-analyze_handler.setLevel(logging.INFO)  # Set to INFO to reduce log size
+analyze_handler.setLevel(logging.INFO)
 analyze_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 analyze_handler.setFormatter(analyze_formatter)
 analyze_logger = logging.getLogger('analyze')
 analyze_logger.addHandler(analyze_handler)
-analyze_logger.setLevel(logging.DEBUG)  # Logger level remains DEBUG
+analyze_logger.setLevel(logging.DEBUG)
 analyze_logger.propagate = False
 
 # Console handler for development

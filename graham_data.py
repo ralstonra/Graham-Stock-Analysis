@@ -14,8 +14,12 @@ import hashlib
 import concurrent.futures
 import requests
 import random
-from config import (FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, NYSE_LIST_FILE, NASDAQ_LIST_FILE,
-                    DATA_DIR, FAVORITES_LOCK, FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID, screening_logger, analyze_logger)
+from config import (
+    FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, 
+    NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR, FAVORITES_LOCK, 
+    FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID, 
+    screening_logger, analyze_logger
+)
 
 # Constants for batch processing and concurrency control
 MAX_CONCURRENT_TICKERS = 10
@@ -506,10 +510,9 @@ def calculate_common_criteria(ticker: str, eps_list: List[float], div_list: List
     if current_passed:
         score += 1
 
-    max_negative_years = min(2, available_data_years // 5)
     negative_eps_count = sum(1 for eps in eps_list if eps <= 0)
-    stability_passed = negative_eps_count <= max_negative_years
-    analyze_logger.debug(f"{ticker}: Criterion 3 - Earnings Stability (<= {max_negative_years} negative years): {'Yes' if stability_passed else 'No'} ({negative_eps_count} negatives, EPS List: {eps_list})")
+    stability_passed = negative_eps_count == 0
+    analyze_logger.debug(f"{ticker}: Criterion 3 - All Positive EPS: {'Yes' if stability_passed else 'No'} (Negative EPS years: {negative_eps_count}, EPS List: {eps_list})")
     if stability_passed:
         score += 1
 
@@ -650,17 +653,33 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                         "sector": cached_data['sector']
                     }
                 else:
-                    # Fetch price from Yahoo Finance for analysis mode
-                    try:
-                        stock = yf.Ticker(ticker)
-                        info = stock.info
-                        price = info.get('regularMarketPrice', info.get('previousClose', None))
-                        if price is None:
-                            analyze_logger.error(f"No price data for {ticker} from YFinance")
-                            return {"ticker": ticker, "exchange": ticker_exchange, "error": "No price data from YFinance"}
-                    except Exception as e:
-                        analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
-                        return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                    # Fetch price from Yahoo Finance with retry logic
+                    max_retries = 3
+                    delay = 1  # Starting delay in seconds
+                    for attempt in range(max_retries):
+                        try:
+                            stock = yf.Ticker(ticker)
+                            history = stock.history(period="1d")
+                            if not history.empty:
+                                price = history['Close'].iloc[-1]
+                            else:
+                                raise ValueError(f"No historical price data for {ticker} from YFinance")
+                            break
+                        except requests.exceptions.HTTPError as e:
+                            if e.response.status_code == 429 and attempt < max_retries - 1:
+                                analyze_logger.warning(f"Rate limit hit for {ticker}, retrying in {delay} seconds...")
+                                await asyncio.sleep(delay)
+                                delay *= 2
+                            else:
+                                analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
+                                return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                        except Exception as e:
+                            analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
+                            return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                    else:
+                        # All retries failed
+                        analyze_logger.error(f"Failed to fetch price for {ticker} after {max_retries} attempts due to rate limiting")
+                        return {"ticker": ticker, "exchange": ticker_exchange, "error": "Rate limit exceeded, please try again later"}
 
                     pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] > 0 else None
                     pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] > 0 else None
@@ -907,7 +926,8 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
+        # In screen_nyse_graham_stocks
+        invalid_file = os.path.join(USER_DATA_DIR, "NYSE Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
                 invalid_tickers = set(f.read().splitlines())
@@ -944,18 +964,18 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
-                if available_data_years >= 10 and common_score is not None and common_score >= 5:
+                if available_data_years >= 10 and common_score is not None and common_score == 6:
                     if log_full:
-                        screening_logger.info(f"{ticker}: Qualified with score {common_score}/6")
+                        screening_logger.info(f"{ticker}: Qualified with all 6 criteria met")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
                     cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
+                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
                 else:
                     if log_full:
-                        reason = "Insufficient data years" if available_data_years < 10 else "Low score" if common_score is not None else "No score calculated"
+                        reason = "Insufficient data years" if available_data_years < 10 else "Did not meet all 6 criteria" if common_score is not None else "No score calculated"
                         screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
@@ -971,7 +991,7 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
             screening_logger.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
 
         if error_tickers:
-            invalid_file = os.path.join(DATA_DIR, "NYSE Invalid Tickers.txt")
+            invalid_file = os.path.join(USER_DATA_DIR, "NYSE Invalid Tickers.txt")
             if os.path.exists(invalid_file):
                 with open(invalid_file, 'r') as f:
                     existing_invalid = set(f.read().splitlines())
@@ -1023,7 +1043,8 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
+        # In screen_nasdaq_graham_stocks
+        invalid_file = os.path.join(USER_DATA_DIR, "NASDAQ Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
                 invalid_tickers = set(f.read().splitlines())
@@ -1060,18 +1081,18 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
-                if available_data_years >= 10 and common_score is not None and common_score >= 5:
+                if available_data_years >= 10 and common_score is not None and common_score == 6:
                     if log_full:
-                        screening_logger.info(f"{ticker}: Qualified with score {common_score}/6")
+                        screening_logger.info(f"{ticker}: Qualified with all 6 criteria met")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
                     cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                   (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
+                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
                 else:
                     if log_full:
-                        reason = "Insufficient data years" if available_data_years < 10 else "Low score" if common_score is not None else "No score calculated"
+                        reason = "Insufficient data years" if available_data_years < 10 else "Did not meet all 6 criteria" if common_score is not None else "No score calculated"
                         screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
@@ -1087,7 +1108,7 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
             screening_logger.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
 
         if error_tickers:
-            invalid_file = os.path.join(DATA_DIR, "NASDAQ Invalid Tickers.txt")
+            invalid_file = os.path.join(USER_DATA_DIR, "NASDAQ Invalid Tickers.txt")
             if os.path.exists(invalid_file):
                 with open(invalid_file, 'r') as f:
                     existing_invalid = set(f.read().splitlines())
