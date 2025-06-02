@@ -14,6 +14,7 @@ import hashlib
 import concurrent.futures
 import requests
 import random
+from ftplib import FTP
 from config import (
     FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, 
     NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR, FAVORITES_LOCK, 
@@ -39,7 +40,7 @@ aaa_yield_cache = None
 cache_timestamp = None
 CACHE_DURATION = timedelta(days=1)
 
-# Hardcoded sector growth rates
+# Hardcoded sector growth rates (no longer used for intrinsic value but kept for reference)
 SECTOR_GROWTH_RATES = {
     "Energy": 4.0,
     "Materials": 4.0,
@@ -104,6 +105,8 @@ def get_stocks_connection():
             dividend TEXT,
             ticker_list_hash TEXT,
             balance_data TEXT,
+            cash_flow_data TEXT,
+            key_metrics_data TEXT,
             timestamp REAL,
             company_name TEXT,
             debt_to_equity REAL,
@@ -113,19 +116,39 @@ def get_stocks_connection():
             latest_revenue REAL,
             available_data_years INTEGER,
             sector TEXT,
-            years TEXT
+            years TEXT,
+            latest_total_assets REAL,
+            latest_total_liabilities REAL,
+            latest_shares_outstanding REAL,
+            latest_long_term_debt REAL,
+            latest_short_term_debt REAL,
+            latest_current_assets REAL,
+            latest_current_liabilities REAL,
+            latest_book_value REAL,
+            historic_pe_ratios TEXT,
+            latest_net_income REAL,
+            eps_cagr REAL
         )''')
         cursor.execute("PRAGMA table_info(stocks)")
         columns = [col[1] for col in cursor.fetchall()]
-        if 'available_data_years' not in columns:
-            cursor.execute("ALTER TABLE stocks ADD COLUMN available_data_years INTEGER")
-            analyze_logger.info("Added 'available_data_years' column to stocks table")
-        if 'sector' not in columns:
-            cursor.execute("ALTER TABLE stocks ADD COLUMN sector TEXT")
-            analyze_logger.info("Added 'sector' column to stocks table")
-        if 'years' not in columns:
-            cursor.execute("ALTER TABLE stocks ADD COLUMN years TEXT")
-            analyze_logger.info("Added 'years' column to stocks table")
+        new_columns = [
+            'latest_total_assets REAL',
+            'latest_total_liabilities REAL',
+            'latest_shares_outstanding REAL',
+            'latest_long_term_debt REAL',
+            'latest_short_term_debt REAL',
+            'latest_current_assets REAL',
+            'latest_current_liabilities REAL',
+            'latest_book_value REAL',
+            'historic_pe_ratios TEXT',
+            'latest_net_income REAL',
+            'eps_cagr REAL'
+        ]
+        for col in new_columns:
+            col_name = col.split()[0]
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
+                analyze_logger.info(f"Added '{col_name}' column to stocks table")
         cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
             ticker TEXT PRIMARY KEY,
             common_score INTEGER,
@@ -181,21 +204,59 @@ def map_fmp_sector_to_app(sector: str) -> str:
     return mapping.get(sector, 'Unknown')
 
 class TickerManager:
-    def __init__(self, nyse_file: str, nasdaq_file: str):
+    def __init__(self, nyse_file: str, nasdaq_file: str, user_data_dir: str = USER_DATA_DIR):
         self.nyse_tickers = {}
         self.nasdaq_tickers = {}
         self.filtered_nyse = []
         self.filtered_nasdaq = []
         self.nyse_file = nyse_file
         self.nasdaq_file = nasdaq_file
+        self.user_data_dir = user_data_dir
 
-    async def initialize(self):
-        self.filtered_nyse = await load_and_filter_tickers(self.nyse_file, exchange_filter='N', use_cache=True)
-        self.filtered_nasdaq = await load_and_filter_tickers(self.nasdaq_file, exchange_filter='Q', use_cache=True)
+    async def initialize(self, force_update=False, callback=None):
+        if force_update:
+            await self.download_ticker_files()
+        use_cache = not force_update
+        self.filtered_nyse = await load_and_filter_tickers(self.nyse_file, exchange_filter='N', use_cache=use_cache)
+        self.filtered_nasdaq = await load_and_filter_tickers(self.nasdaq_file, exchange_filter='Q', use_cache=use_cache)
         self.nyse_tickers = {ticker["ticker"]: ticker["security_name"] for ticker in self.filtered_nyse}
         self.nasdaq_tickers = {ticker["ticker"]: ticker["security_name"] for ticker in self.filtered_nasdaq}
         analyze_logger.info(f"Initialized NYSE common stock tickers: {len(self.nyse_tickers)}")
         analyze_logger.info(f"Initialized NASDAQ common stock tickers: {len(self.nasdaq_tickers)}")
+        if callback:
+            callback()
+
+    async def download_ticker_files(self):
+        """Download the latest ticker files from FTP and update the hash in the database."""
+        try:
+            ftp = FTP('ftp.nasdaqtrader.com')
+            ftp.login()
+            ftp.cwd('SymbolDirectory')
+            files_to_download = ['nasdaqlisted.txt', 'otherlisted.txt']
+            for file_name in files_to_download:
+                local_path = os.path.join(self.user_data_dir, file_name)
+                with open(local_path, 'wb') as f:
+                    ftp.retrbinary(f'RETR {file_name}', f.write)
+                # Compute and store the hash
+                file_hash = get_file_hash(local_path)
+                conn, cursor = get_stocks_connection()
+                try:
+                    exchange = 'NASDAQ' if 'nasdaq' in file_name.lower() else 'NYSE'
+                    # Insert or update the hash with a dummy ticker to track file freshness
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO screening_progress (exchange, ticker, timestamp, file_hash, status)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (exchange, 'FILE_HASH_TRACKER', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), file_hash, 'completed'))
+                    conn.commit()
+                except sqlite3.Error as e:
+                    analyze_logger.error(f"Error updating hash for {file_name}: {str(e)}")
+                finally:
+                    conn.close()
+            ftp.quit()
+            analyze_logger.info("Successfully downloaded and updated ticker files from FTP.")
+        except Exception as e:
+            analyze_logger.error(f"Failed to download ticker files: {str(e)}")
+            raise
 
     def get_tickers(self, exchange: str) -> set:
         if exchange == "NYSE":
@@ -221,10 +282,13 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
 
     conn, cursor = get_stocks_connection()
     try:
-        cursor.execute("SELECT ticker, timestamp, company_name FROM stocks WHERE ticker_list_hash = ?", (file_hash,))
-        cached_data = cursor.fetchall()
-        cached_entries = {row[0]: (row[1], row[2]) for row in cached_data}
-        analyze_logger.debug(f"Loaded {len(cached_entries)} entries from stocks table for hash {file_hash}")
+        if use_cache:
+            cursor.execute("SELECT ticker, timestamp, company_name FROM stocks WHERE ticker_list_hash = ?", (file_hash,))
+            cached_data = cursor.fetchall()
+            cached_entries = {row[0]: (row[1], row[2]) for row in cached_data}
+            analyze_logger.debug(f"Loaded {len(cached_entries)} entries from stocks table for hash {file_hash}")
+        else:
+            cached_entries = {}  # No cache, treat all as missing
 
         ticker_data = []
         fresh_count = 0
@@ -276,7 +340,11 @@ async def load_and_filter_tickers(file_path: str, exchange_filter: Optional[str]
                     if exchange != exchange_filter:
                         continue
 
-                timestamp, company_name = cached_entries.get(ticker, (None, None))
+                if use_cache:
+                    timestamp, company_name = cached_entries.get(ticker, (None, None))
+                else:
+                    timestamp, company_name = None, None
+
                 current_time = time.time()
 
                 if timestamp is not None:
@@ -338,7 +406,7 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
             analyze_logger.debug(f"Attempt {attempt + 1}/{retries} for {ticker} ({endpoint}) with key ending in {api_key[-4:]}")
             try:
                 await limiter.acquire()
-                if endpoint in ["income-statement", "balance-sheet-statement"]:
+                if endpoint in ["income-statement", "balance-sheet-statement", "cash-flow-statement", "key-metrics"]:
                     url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?period=annual&limit=10&apikey={api_key}"
                 elif endpoint == "historical-price-full/stock_dividend":
                     url = f"https://financialmodelingprep.com/api/v3/{endpoint}/{ticker}?apikey={api_key}"
@@ -390,24 +458,26 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
     analyze_logger.error(f"All attempts and keys exhausted for {ticker} ({endpoint})")
     return None
 
-async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, cancel_event=None) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[Dict], Optional[List[Dict]]]:
-    """Fetch core financial data from FMP: income statement, balance sheet, dividends, and profile."""
+async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, cancel_event=None) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[Dict], Optional[List[Dict]], Optional[List[Dict]], Optional[List[Dict]]]:
+    """Fetch core financial data from FMP: income statement, balance sheet, dividends, profile, cash flow statement, and key metrics."""
     primary_key = keys[0]
     
     income_data = await fetch_with_multiple_keys_async(ticker, "income-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     balance_data = await fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     dividend_data = await fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     profile_data = await fetch_with_multiple_keys_async(ticker, "profile", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
+    cash_flow_data = await fetch_with_multiple_keys_async(ticker, "cash-flow-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
+    key_metrics_data = await fetch_with_multiple_keys_async(ticker, "key-metrics", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
     
-    if not income_data or not balance_data or not dividend_data or not profile_data:
-        analyze_logger.error(f"FMP fetch failed for {ticker}: Incomplete data (Income: {bool(income_data)}, Balance: {bool(balance_data)}, Dividends: {bool(dividend_data)}, Profile: {bool(profile_data)})")
-        return None, None, None, None
+    if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
+        analyze_logger.error(f"FMP fetch failed for {ticker}: Incomplete data (Income: {bool(income_data)}, Balance: {bool(balance_data)}, Dividends: {bool(dividend_data)}, Profile: {bool(profile_data)}, Cash Flow: {bool(cash_flow_data)}, Key Metrics: {bool(key_metrics_data)})")
+        return None, None, None, None, None, None
     
     analyze_logger.info(f"Successfully fetched FMP data for {ticker}")
-    return income_data, balance_data, dividend_data, profile_data
+    return income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data
 
 async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit=None, cancel_event=None, income_data=None, balance_data=None, dividend_data=None) -> Tuple[List[float], List[float], List[float], List[float], List[int], Dict[str, float], List[Dict]]:
-    """Process FMP data into historical financial metrics for Graham analysis using FMP dividends."""
+    """Process FMP data into historical financial metrics for Graham analysis using FMxP dividends."""
     roe_list = []
     rotc_list = []
     eps_list = []
@@ -561,7 +631,10 @@ def calculate_graham_score_8(ticker: str, price: float, pe_ratio: Optional[float
     return score
 
 async def calculate_graham_value(earnings: Optional[float], stock_data: dict) -> float:
-    """Calculate Graham intrinsic value using Moody's AAA yield and sector growth rate with annual EPS."""
+    """
+    Calculate Graham intrinsic value using Moody's AAA yield and stock-specific EPS CAGR.
+    Caps the growth rate at zero to avoid negative intrinsic values when CAGR is negative.
+    """
     if not earnings or earnings <= 0:
         analyze_logger.warning(f"Invalid earnings for {stock_data['ticker']}: {earnings}")
         return float('nan')
@@ -569,13 +642,15 @@ async def calculate_graham_value(earnings: Optional[float], stock_data: dict) ->
     if aaa_yield <= 0:
         analyze_logger.error("Moody's AAA yield is zero or negative.")
         return float('nan')
-    sector = stock_data.get('sector', 'Unknown')
-    g = get_sector_growth_rate(sector)
-    if g == 4.0 and sector != 'Unknown':
-        analyze_logger.debug(f"Using default growth rate 4.0% for sector '{sector}' as no specific rate found")
+    # Get EPS CAGR from stock data, default to 0.0 if not present
+    eps_cagr = stock_data.get('eps_cagr', 0.0)
+    # Convert to percentage and cap at 0 to handle negative CAGR
+    g = max(eps_cagr * 100, 0)
+    # Calculate earnings multiplier, capped between 8.5 (no growth) and 20 (max growth)
+    earnings_multiplier = min(8.5 + 2 * g, 20)
     normalization_factor = 4.4
-    value = (earnings * (8.5 + 2 * g) * normalization_factor) / (100 * aaa_yield)
-    analyze_logger.debug(f"Calculated Graham value for {stock_data['ticker']}: EPS={earnings}, Sector={sector}, Growth={g}%, AAA Yield={aaa_yield}, Value={value}")
+    value = (earnings * earnings_multiplier * normalization_factor) / (100 * aaa_yield)
+    analyze_logger.debug(f"Calculated Graham value for {stock_data['ticker']}: EPS={earnings}, eps_cagr={eps_cagr}, Earnings Multiplier={earnings_multiplier}, AAA Yield={aaa_yield}, Value={value}")
     return value
 
 async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, margin_of_safety=0.33, exchange="Stock", ticker_manager=None, update_rate_limit=None, cancel_event=None):
@@ -610,19 +685,33 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
             cursor.execute(
                 """INSERT OR REPLACE INTO stocks 
                    (ticker, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, 
-                    timestamp, company_name, debt_to_equity, eps_ttm, book_value_per_share, 
-                    common_score, latest_revenue, available_data_years, sector, years) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    cash_flow_data, key_metrics_data, timestamp, company_name, debt_to_equity, 
+                    eps_ttm, book_value_per_share, common_score, latest_revenue, 
+                    available_data_years, sector, years,
+                    latest_total_assets, latest_total_liabilities, latest_shares_outstanding,
+                    latest_long_term_debt, latest_short_term_debt, latest_current_assets,
+                    latest_current_liabilities, latest_book_value, historic_pe_ratios,
+                    latest_net_income, eps_cagr) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result['ticker'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  ",".join(map(str, result['roe_list'] if 'roe_list' in result else [])),
                  ",".join(map(str, result['rotc_list'] if 'rotc_list' in result else [])),
                  ",".join(map(str, result['eps_list'] if 'eps_list' in result else [])),
                  ",".join(map(str, result['div_list'] if 'div_list' in result else [])),
-                 ticker_list_hash, json.dumps(result['balance_data'] if 'balance_data' in result else []),
+                 ticker_list_hash, 
+                 json.dumps(result['balance_data'] if 'balance_data' in result else []),
+                 json.dumps(result['cash_flow_data'] if 'cash_flow_data' in result else []),
+                 json.dumps(result['key_metrics_data'] if 'key_metrics_data' in result else []),
                  result['timestamp'], result['company_name'], result['debt_to_equity'],
                  result['eps_ttm'], result['book_value_per_share'], result['common_score'],
                  result['latest_revenue'], result['available_data_years'], result['sector'],
-                 ",".join(map(str, result['years'] if 'years' in result else [])))
+                 ",".join(map(str, result['years'] if 'years' in result else [])),
+                 result['latest_total_assets'], result['latest_total_liabilities'],
+                 result['latest_shares_outstanding'], result['latest_long_term_debt'],
+                 result['latest_short_term_debt'], result['latest_current_assets'],
+                 result['latest_current_liabilities'], result['latest_book_value'],
+                 result['historic_pe_ratios'], result['latest_net_income'], result['eps_cagr'])
             )
             conn.commit()
             analyze_logger.info(f"Saved {result['ticker']} to database with hash {ticker_list_hash}")
@@ -632,171 +721,222 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
             conn.close()
 
     async def fetch_data(ticker):
-        async with semaphore:
-            if cancel_event and cancel_event.is_set():
-                return {"ticker": ticker, "exchange": exchange, "error": "Cancelled by user"}
+        try:
+            async with semaphore:
+                if cancel_event and cancel_event.is_set():
+                    return {"ticker": ticker, "exchange": exchange, "error": "Cancelled by user"}
 
-            ticker_exchange = "NYSE" if ticker in nyse_tickers else "NASDAQ" if ticker in nasdaq_tickers else "Unknown"
-            cached_data = get_stock_data_from_db(ticker)
-            current_time = time.time()
+                ticker_exchange = "NYSE" if ticker in nyse_tickers else "NASDAQ" if ticker in nasdaq_tickers else "Unknown"
+                cached_data = get_stock_data_from_db(ticker)
+                current_time = time.time()
 
-            # Modified cache check to include 'years'
-            if cached_data and cached_data['timestamp'] and (current_time - cached_data['timestamp'] < CACHE_EXPIRY) and cached_data.get('years'):
-                analyze_logger.debug(f"Cache hit for {ticker}: Years={cached_data['years']}")
-                if screening_mode:
-                    return {
-                        "ticker": ticker,
-                        "exchange": ticker_exchange,
-                        "company_name": cached_data['company_name'],
-                        "common_score": cached_data['common_score'],
-                        "available_data_years": cached_data['available_data_years'],
-                        "sector": cached_data['sector']
-                    }
-                else:
-                    # Fetch price from Yahoo Finance with retry logic
-                    max_retries = 3
-                    delay = 1  # Starting delay in seconds
-                    for attempt in range(max_retries):
-                        try:
-                            stock = yf.Ticker(ticker)
-                            history = stock.history(period="1d")
-                            if not history.empty:
-                                price = history['Close'].iloc[-1]
-                            else:
-                                raise ValueError(f"No historical price data for {ticker} from YFinance")
-                            break
-                        except requests.exceptions.HTTPError as e:
-                            if e.response.status_code == 429 and attempt < max_retries - 1:
-                                analyze_logger.warning(f"Rate limit hit for {ticker}, retrying in {delay} seconds...")
-                                await asyncio.sleep(delay)
-                                delay *= 2
-                            else:
+                # Modified cache check to include 'years'
+                if cached_data and cached_data['timestamp'] and (current_time - cached_data['timestamp'] < CACHE_EXPIRY) and cached_data.get('years'):
+                    analyze_logger.debug(f"Cache hit for {ticker}: Years={cached_data['years']}")
+                    if screening_mode:
+                        return {
+                            "ticker": ticker,
+                            "exchange": ticker_exchange,
+                            "company_name": cached_data['company_name'],
+                            "common_score": cached_data['common_score'],
+                            "available_data_years": cached_data['available_data_years'],
+                            "sector": cached_data['sector']
+                        }
+                    else:
+                        # Fetch price from Yahoo Finance with retry logic
+                        max_retries = 3
+                        delay = 1  # Starting delay in seconds
+                        for attempt in range(max_retries):
+                            try:
+                                stock = yf.Ticker(ticker)
+                                history = stock.history(period="1d")
+                                if not history.empty:
+                                    price = history['Close'].iloc[-1]
+                                else:
+                                    raise ValueError(f"No historical price data for {ticker} from YFinance")
+                                break
+                            except requests.exceptions.HTTPError as e:
+                                if e.response.status_code == 429 and attempt < max_retries - 1:
+                                    analyze_logger.warning(f"Rate limit hit for {ticker}, retrying in {delay} seconds...")
+                                    await asyncio.sleep(delay)
+                                    delay *= 2
+                                else:
+                                    analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
+                                    return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                            except Exception as e:
                                 analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
                                 return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
-                        except Exception as e:
-                            analyze_logger.error(f"Error fetching price for {ticker} from YFinance: {str(e)}")
-                            return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
-                    else:
-                        # All retries failed
-                        analyze_logger.error(f"Failed to fetch price for {ticker} after {max_retries} attempts due to rate limiting")
-                        return {"ticker": ticker, "exchange": ticker_exchange, "error": "Rate limit exceeded, please try again later"}
+                        else:
+                            # All retries failed
+                            analyze_logger.error(f"Failed to fetch price for {ticker} after {max_retries} attempts due to rate limiting")
+                            return {"ticker": ticker, "exchange": ticker_exchange, "error": "Rate limit exceeded, please try again later"}
 
-                    pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] > 0 else None
-                    pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] > 0 else None
-                    intrinsic_value = await calculate_graham_value(cached_data['eps_ttm'], cached_data) if cached_data['eps_ttm'] else float('nan')
-                    buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
-                    sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
-                    # Reconstruct revenue dictionary using years and latest_revenue
-                    revenue = {}
-                    if cached_data['years'] and cached_data['latest_revenue']:
-                        revenue[str(cached_data['years'][-1])] = cached_data['latest_revenue']
-                    # Ensure historical data lists are aligned with years (ascending order)
-                    graham_score = calculate_graham_score_8(
-                        ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
-                        cached_data['eps_list'], cached_data['div_list'], revenue,
-                        cached_data['balance_data'], cached_data['available_data_years'],
-                        cached_data['latest_revenue']
-                    )
-                    result = {
-                        "ticker": ticker,
-                        "exchange": ticker_exchange,
-                        "company_name": cached_data['company_name'],
-                        "price": price,
-                        "common_score": cached_data['common_score'],
-                        "graham_score": graham_score,
-                        "roe_list": cached_data['roe_list'],
-                        "rotc_list": cached_data['rotc_list'],
-                        "eps_list": cached_data['eps_list'],
-                        "div_list": cached_data['div_list'],
-                        "years": cached_data.get('years', []),
-                        "balance_data": cached_data['balance_data'],
-                        "available_data_years": cached_data['available_data_years'],
-                        "latest_revenue": cached_data['latest_revenue'],
-                        "debt_to_equity": cached_data['debt_to_equity'],
-                        "eps_ttm": cached_data['eps_ttm'],  # Now latest annual EPS
-                        "book_value_per_share": cached_data['book_value_per_share'],
-                        "pe_ratio": pe_ratio,
-                        "pb_ratio": pb_ratio,
-                        "intrinsic_value": intrinsic_value,
-                        "buy_price": buy_price,
-                        "sell_price": sell_price,
-                        "sector": cached_data['sector']
-                    }
-                    return result
-            else:
-                if cached_data and not cached_data.get('years'):
-                    analyze_logger.warning(f"Cache for {ticker} missing 'years', refetching data")
+                        pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else None
+                        pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] and cached_data['book_value_per_share'] > 0 else None
+                        intrinsic_value = await calculate_graham_value(cached_data['eps_ttm'], cached_data) if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else float('nan')
+                        buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
+                        sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
+                        # Reconstruct revenue dictionary using years and latest_revenue
+                        revenue = {}
+                        if cached_data['years'] and cached_data['latest_revenue']:
+                            revenue[str(cached_data['years'][-1])] = cached_data['latest_revenue']
+                        # Ensure historical data lists are aligned with years (ascending order)
+                        graham_score = calculate_graham_score_8(
+                            ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
+                            cached_data['eps_list'], cached_data['div_list'], revenue,
+                            cached_data['balance_data'], cached_data['available_data_years'],
+                            cached_data['latest_revenue']
+                        )
+                        result = {
+                            "ticker": ticker,
+                            "exchange": ticker_exchange,
+                            "company_name": cached_data['company_name'],
+                            "price": price,
+                            "common_score": cached_data['common_score'],
+                            "graham_score": graham_score,
+                            "roe_list": cached_data['roe_list'],
+                            "rotc_list": cached_data['rotc_list'],
+                            "eps_list": cached_data['eps_list'],
+                            "div_list": cached_data['div_list'],
+                            "years": cached_data.get('years', []),
+                            "balance_data": cached_data['balance_data'],
+                            "cash_flow_data": cached_data['cash_flow_data'],
+                            "key_metrics_data": cached_data['key_metrics_data'],
+                            "available_data_years": cached_data['available_data_years'],
+                            "latest_revenue": cached_data['latest_revenue'],
+                            "debt_to_equity": cached_data['debt_to_equity'],
+                            "eps_ttm": cached_data['eps_ttm'],
+                            "book_value_per_share": cached_data['book_value_per_share'],
+                            "pe_ratio": pe_ratio,
+                            "pb_ratio": pb_ratio,
+                            "intrinsic_value": intrinsic_value,
+                            "buy_price": buy_price,
+                            "sell_price": sell_price,
+                            "sector": cached_data['sector'],
+                            "latest_total_assets": cached_data['latest_total_assets'],
+                            "latest_total_liabilities": cached_data['latest_total_liabilities'],
+                            "latest_shares_outstanding": cached_data['latest_shares_outstanding'],
+                            "latest_long_term_debt": cached_data['latest_long_term_debt'],
+                            "latest_short_term_debt": cached_data['latest_short_term_debt'],
+                            "latest_current_assets": cached_data['latest_current_assets'],
+                            "latest_current_liabilities": cached_data['latest_current_liabilities'],
+                            "latest_book_value": cached_data['latest_book_value'],
+                            "historic_pe_ratios": cached_data['historic_pe_ratios'],
+                            "latest_net_income": cached_data['latest_net_income'],
+                            "eps_cagr": cached_data.get('eps_cagr', 0.0)
+                        }
+                        return result
+                else:
+                    if cached_data and not cached_data.get('years'):
+                        analyze_logger.warning(f"Cache for {ticker} missing 'years', refetching data")
 
-            # If cache miss or invalid, fetch from FMP (only during screening)
-            if not screening_mode:
-                analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
-                return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
+                # If cache miss or invalid, fetch from FMP (only during screening)
+                if not screening_mode:
+                    analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
+                    return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
 
-            await asyncio.sleep(DELAY_BETWEEN_CALLS)
-            security_name = ticker_manager.get_security_name(ticker)
-            
-            income_data, balance_data, dividend_data, profile_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
-            if not income_data or not balance_data or not dividend_data or not profile_data:
-                missing = []
-                if not income_data:
-                    missing.append("income_data")
-                if not balance_data:
-                    missing.append("balance_data")
-                if not dividend_data:
-                    missing.append("dividend_data")
-                if not profile_data:
-                    missing.append("profile_data")
-                analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
-                return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
+                await asyncio.sleep(DELAY_BETWEEN_CALLS)
+                security_name = ticker_manager.get_security_name(ticker)
+                
+                income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
+                if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
+                    missing = []
+                    if not income_data:
+                        missing.append("income_data")
+                    if not balance_data:
+                        missing.append("balance_data")
+                    if not dividend_data:
+                        missing.append("dividend_data")
+                    if not profile_data:
+                        missing.append("profile_data")
+                    if not cash_flow_data:
+                        missing.append("cash_flow_data")
+                    if not key_metrics_data:
+                        missing.append("key_metrics_data")
+                    analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
+                    return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
 
-            company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
-            sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
+                company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
+                sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
 
-            latest_balance = balance_data[0] if balance_data else {}
-            shareholder_equity = float(latest_balance.get('totalStockholdersEquity', 1))
-            long_term_debt = float(latest_balance.get('longTermDebt', 0))
-            debt_to_equity = long_term_debt / shareholder_equity if shareholder_equity != 0 else None
-            shares_outstanding = float(income_data[0].get('weightedAverageShsOut', 1)) if income_data else 1
-            book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding > 0 else 0
+                latest_balance = balance_data[0] if balance_data else None
+                shareholder_equity = float(latest_balance['totalStockholdersEquity']) if latest_balance and 'totalStockholdersEquity' in latest_balance else None
+                long_term_debt = float(latest_balance['longTermDebt']) if latest_balance and 'longTermDebt' in latest_balance else None
+                debt_to_equity = long_term_debt / shareholder_equity if shareholder_equity and shareholder_equity != 0 and long_term_debt is not None else None
+                shares_outstanding = float(income_data[0]['weightedAverageShsOut']) if income_data and 'weightedAverageShsOut' in income_data[0] else None
+                book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding and shares_outstanding > 0 and shareholder_equity is not None else None
 
-            roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list = await fetch_historical_data(
-                ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data
-            )
-            available_data_years = len(years_available)
-            latest_revenue = revenue.get(str(years_available[-1]) if years_available else '', 0)  # Latest year
-            # Use latest annual EPS instead of calculating eps_ttm
-            eps_ttm = eps_list[-1] if eps_list else 0  # Latest annual EPS
-            common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data_list, debt_to_equity, available_data_years, latest_revenue)
+                roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list = await fetch_historical_data(
+                    ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data
+                )
+                latest_net_income = float(income_data[0]['netIncome']) if income_data and 'netIncome' in income_data[0] else None
+                available_data_years = len(years_available)
+                latest_revenue = revenue.get(str(years_available[-1]) if years_available else '', 0)  # Latest year
+                eps_ttm = eps_list[-1] if eps_list else None  # Latest annual EPS
+                common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data_list, debt_to_equity, available_data_years, latest_revenue)
 
-            full_result = {
-                "ticker": ticker,
-                "exchange": ticker_exchange,
-                "company_name": company_name,
-                "roe_list": roe_list,
-                "rotc_list": rotc_list,
-                "eps_list": eps_list,
-                "div_list": div_list,
-                "years": years_available,  # Ensure this is included
-                "balance_data": balance_data_list,
-                "available_data_years": available_data_years,
-                "latest_revenue": latest_revenue,
-                "debt_to_equity": debt_to_equity,
-                "eps_ttm": eps_ttm,  # Now latest annual EPS
-                "book_value_per_share": book_value_per_share,
-                "timestamp": time.time(),
-                "common_score": common_score,
-                "sector": sector
-            }
+                # Calculate eps_cagr
+                if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
+                    eps_cagr = calculate_cagr(eps_list[0], eps_list[-1], len(eps_list) - 1)
+                else:
+                    eps_cagr = 0.0
 
-            save_to_db(full_result)
-            return {
-                "ticker": ticker,
-                "exchange": ticker_exchange,
-                "company_name": company_name,
-                "common_score": common_score,
-                "available_data_years": available_data_years,
-                "sector": sector
-            }
+                # Extract new data points
+                latest_total_assets = float(latest_balance['totalAssets']) if latest_balance and 'totalAssets' in latest_balance else None
+                latest_total_liabilities = float(latest_balance['totalLiabilities']) if latest_balance and 'totalLiabilities' in latest_balance else None
+                latest_shares_outstanding = shares_outstanding
+                latest_long_term_debt = long_term_debt
+                latest_short_term_debt = float(latest_balance['shortTermDebt']) if latest_balance and 'shortTermDebt' in latest_balance else None
+                latest_current_assets = float(latest_balance['totalCurrentAssets']) if latest_balance and 'totalCurrentAssets' in latest_balance else None
+                latest_current_liabilities = float(latest_balance['totalCurrentLiabilities']) if latest_balance and 'totalCurrentLiabilities' in latest_balance else None
+                latest_book_value = shareholder_equity
+                historic_pe_ratios = json.dumps([entry.get('peRatio', 0) for entry in key_metrics_data]) if key_metrics_data else '[]'
+
+                full_result = {
+                    "ticker": ticker,
+                    "exchange": ticker_exchange,
+                    "company_name": company_name,
+                    "roe_list": roe_list,
+                    "rotc_list": rotc_list,
+                    "eps_list": eps_list,
+                    "div_list": div_list,
+                    "years": years_available,
+                    "balance_data": balance_data_list,
+                    "cash_flow_data": cash_flow_data,
+                    "key_metrics_data": key_metrics_data,
+                    "available_data_years": available_data_years,
+                    "latest_revenue": latest_revenue,
+                    "debt_to_equity": debt_to_equity,
+                    "eps_ttm": eps_ttm,
+                    "book_value_per_share": book_value_per_share,
+                    "timestamp": time.time(),
+                    "common_score": common_score,
+                    "sector": sector,
+                    "latest_total_assets": latest_total_assets,
+                    "latest_total_liabilities": latest_total_liabilities,
+                    "latest_shares_outstanding": latest_shares_outstanding,
+                    "latest_long_term_debt": latest_long_term_debt,
+                    "latest_short_term_debt": latest_short_term_debt,
+                    "latest_current_assets": latest_current_assets,
+                    "latest_current_liabilities": latest_current_liabilities,
+                    "latest_book_value": latest_book_value,
+                    "historic_pe_ratios": historic_pe_ratios,
+                    "latest_net_income": latest_net_income,
+                    "eps_cagr": eps_cagr
+                }
+
+                save_to_db(full_result)
+                return {
+                    "ticker": ticker,
+                    "exchange": ticker_exchange,
+                    "company_name": company_name,
+                    "common_score": common_score,
+                    "available_data_years": available_data_years,
+                    "sector": sector
+                }
+        except Exception as e:
+            analyze_logger.error(f"Error processing {ticker}: {str(e)}")
+            return {"ticker": ticker, "exchange": exchange, "error": f"Processing failed: {str(e)}"}
 
     for ticker in tickers:
         tasks.append(fetch_data(ticker))
@@ -807,12 +947,29 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
         analyze_logger.error("Timeout while fetching batch data")
         results = []
 
-    error_tickers = [ticker for ticker, result in zip(tickers, results) if isinstance(result, dict) and 'error' in result]
-    valid_results = [r for r in results if isinstance(r, dict) and 'error' not in r]
+    # Process results
+    valid_results = []
+    error_tickers = []
+    for ticker, result in zip(tickers, results):
+        if isinstance(result, Exception):
+            # Log any exception that occurred during fetch_data
+            analyze_logger.error(f"Exception processing {ticker}: {str(result)}")
+            error_tickers.append(ticker)
+        elif isinstance(result, dict):
+            if 'error' in result:
+                # Explicit error dictionary from fetch_data
+                error_tickers.append(ticker)
+                analyze_logger.debug(f"Error for {ticker}: {result['error']}")
+            else:
+                # Valid result
+                valid_results.append(result)
+        else:
+            # Unexpected result type
+            analyze_logger.error(f"Unexpected result type for {ticker}: {type(result)}")
+            error_tickers.append(ticker)
 
-    if error_tickers:
-        analyze_logger.info(f"Error tickers during batch fetch: {error_tickers}")
-
+    analyze_logger.debug(f"Batch fetch complete: {len(valid_results)} valid, {len(error_tickers)} errors")
+    analyze_logger.debug(f"Error tickers during batch fetch: {error_tickers}")
     return valid_results, error_tickers
 
 async def fetch_stock_data(ticker, expected_return=0.0, margin_of_safety=0.33, exchange="Stock", ticker_manager=None, update_rate_limit=None, cancel_event=None):
@@ -880,15 +1037,28 @@ def get_stock_data_from_db(ticker):
                 "div_list": div_list,
                 "years": years,
                 "balance_data": json.loads(stock_dict['balance_data']) if stock_dict['balance_data'] else [],
+                "cash_flow_data": json.loads(stock_dict['cash_flow_data']) if stock_dict.get('cash_flow_data') else [],
+                "key_metrics_data": json.loads(stock_dict['key_metrics_data']) if stock_dict.get('key_metrics_data') else [],
                 "timestamp": stock_dict['timestamp'],
                 "company_name": stock_dict['company_name'],
-                "debt_to_equity": stock_dict['debt_to_equity'],
-                "eps_ttm": stock_dict['eps_ttm'],  # Now latest annual EPS
-                "book_value_per_share": stock_dict['book_value_per_share'],
-                "common_score": stock_dict['common_score'],
-                "latest_revenue": stock_dict['latest_revenue'],
+                "debt_to_equity": stock_dict.get('debt_to_equity'),
+                "eps_ttm": stock_dict.get('eps_ttm'),
+                "book_value_per_share": stock_dict.get('book_value_per_share'),
+                "common_score": stock_dict.get('common_score', 0),  # Default to 0 if missing
+                "latest_revenue": stock_dict.get('latest_revenue', 0.0),  # Default to 0.0 if missing
                 "available_data_years": stock_dict['available_data_years'],
-                "sector": stock_dict.get('sector', 'Unknown')
+                "sector": stock_dict.get('sector', 'Unknown'),
+                "latest_total_assets": stock_dict.get('latest_total_assets'),
+                "latest_total_liabilities": stock_dict.get('latest_total_liabilities'),
+                "latest_shares_outstanding": stock_dict.get('latest_shares_outstanding'),
+                "latest_long_term_debt": stock_dict.get('latest_long_term_debt'),
+                "latest_short_term_debt": stock_dict.get('latest_short_term_debt'),
+                "latest_current_assets": stock_dict.get('latest_current_assets'),
+                "latest_current_liabilities": stock_dict.get('latest_current_liabilities'),
+                "latest_book_value": stock_dict.get('latest_book_value'),
+                "historic_pe_ratios": json.loads(stock_dict.get('historic_pe_ratios', '[]')),
+                "latest_net_income": stock_dict.get('latest_net_income'),
+                "eps_cagr": stock_dict.get('eps_cagr', 0.0)
             }
             analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}")
             return result
@@ -926,7 +1096,6 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        # In screen_nyse_graham_stocks
         invalid_file = os.path.join(USER_DATA_DIR, "NYSE Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
@@ -944,7 +1113,7 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
 
         sample_interval = max(10, total_tickers // 50)
 
-        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 4))  # 4 calls/ticker
+        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 6))  # 6 calls/ticker now
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
                 screening_logger.info("Screening cancelled by user")
@@ -1043,7 +1212,6 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
         tickers = filtered_ticker_data if tickers is None else tickers
         ticker_list = [t["ticker"] for t in tickers]
 
-        # In screen_nasdaq_graham_stocks
         invalid_file = os.path.join(USER_DATA_DIR, "NASDAQ Invalid Tickers.txt")
         if os.path.exists(invalid_file):
             with open(invalid_file, 'r') as f:
@@ -1061,7 +1229,7 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
 
         sample_interval = max(10, total_tickers // 50)
 
-        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 4))  # 4 calls/ticker
+        dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 6))  # 6 calls/ticker now
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
                 screening_logger.info("Screening cancelled by user")

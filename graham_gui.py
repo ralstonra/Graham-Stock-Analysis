@@ -10,21 +10,25 @@ import time
 import os
 import json
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from graham_data import (screen_nasdaq_graham_stocks, screen_nyse_graham_stocks, fetch_batch_data,
                          fetch_stock_data, get_stocks_connection, fetch_with_multiple_keys_async,
                          NYSE_LIST_FILE, NASDAQ_LIST_FILE, TickerManager, get_file_hash,
                          calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
                          clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db,
-                         get_sector_growth_rate, calculate_cagr)
+                         get_sector_growth_rate, calculate_cagr, get_aaa_yield)
 from config import (
     BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, 
-    CACHE_EXPIRY, screening_logger, analyze_logger, USER_DATA_DIR
+    CACHE_EXPIRY, screening_logger, analyze_logger, USER_DATA_DIR, FRED_API_KEY
 )
 import queue
 import shutil
 import requests
 import ftplib
+import openpyxl
+from openpyxl.chart import LineChart, Reference
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, Border, Side
 
 FAVORITES_LOCK = threading.Lock()
 DATA_DIR = BASE_DIR
@@ -41,7 +45,7 @@ class GrahamScreeningApp:
         self.cancel_event = threading.Event()
         self.margin_of_safety_var = tk.DoubleVar(value=33.0)
         self.expected_return_var = tk.DoubleVar(value=0.0)
-        self.ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
+        self.ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR)
         self.screening_active = False
         self.analysis_lock = threading.Lock()
         self.ticker_cache = {}
@@ -132,7 +136,6 @@ class GrahamScreeningApp:
 
         def save_favorite():
             print("Save Favorite button clicked")  # Debug
-            # Ensure TickerManager is initialized
             self.task_queue.put(self.ticker_manager.initialize())
             time.sleep(1)  # Wait for initialization (adjust if needed)
             print(f"NYSE tickers: {len(self.ticker_manager.nyse_tickers)}, NASDAQ tickers: {len(self.ticker_manager.nasdaq_tickers)}")  # Debug
@@ -414,10 +417,16 @@ class GrahamScreeningApp:
                         screening_logger.info(f"No qualifying stocks found for {exchange}")
                     conn, cursor = get_stocks_connection()
                     try:
-                        processed_tickers = cursor.execute("SELECT COUNT(*) FROM screening_progress WHERE exchange=? AND status='completed'", (exchange,)).fetchone()[0]
+                        processed_tickers = cursor.execute(
+                            "SELECT COUNT(*) FROM screening_progress WHERE exchange=? AND status='completed'",
+                            (exchange,)
+                        ).fetchone()[0]
                         total_tickers = processed_tickers + len(error_tickers)
                         ticker_list = list(self.ticker_manager.get_tickers(exchange))
-                        cache_hits = sum(1 for t in ticker_list if get_stock_data_from_db(t) and time.time() - get_stock_data_from_db(t)['timestamp'] < CACHE_EXPIRY)
+                        cache_hits = sum(
+                            1 for t in ticker_list
+                            if get_stock_data_from_db(t) and time.time() - get_stock_data_from_db(t)['timestamp'] < CACHE_EXPIRY
+                        )
                         self.root.after(0, lambda: self.update_cache_usage(cache_hits, total_tickers))
                         summary = f"Completed {exchange} screening.\nProcessed {total_tickers} stocks,\nFound {len(qualifying_stocks)} qualifiers,\n{len(error_tickers)} errors"
                         if error_tickers:
@@ -436,7 +445,6 @@ class GrahamScreeningApp:
                 setattr(self, f"{exchange.lower()}_screen_var", tk.BooleanVar(value=False))
                 self.screening_active = False
 
-        ticker_list = list(self.ticker_manager.get_tickers(exchange))
         self.task_queue.put(screening_task())
 
     def run_nyse_screening(self):
@@ -506,7 +514,8 @@ class GrahamScreeningApp:
                             "ticker": stock_dict['ticker'],
                             "sector": sector,
                             "eps_ttm": eps_ttm,
-                            "eps_list": eps_list
+                            "eps_list": eps_list,
+                            "eps_cagr": stock_dict.get('eps_cagr', 0.0)
                         }
                         intrinsic_value = await calculate_graham_value(eps_ttm, cached_stock_data) if eps_ttm is not None and eps_ttm > 0 else float('nan')
                         margin_of_safety = self.margin_of_safety_var.get() / 100
@@ -535,7 +544,8 @@ class GrahamScreeningApp:
                             "available_data_years": stock_dict['available_data_years'],
                             "eps_ttm": eps_ttm,
                             "book_value_per_share": book_value_per_share,
-                            "debt_to_equity": debt_to_equity
+                            "debt_to_equity": debt_to_equity,
+                            "eps_cagr": stock_dict.get('eps_cagr', 0.0)
                         }
                         with self.ticker_cache_lock:
                             self.ticker_cache[ticker] = result
@@ -616,7 +626,7 @@ class GrahamScreeningApp:
         valid_results = [r for r in results if 'error' not in r]
         passed_tickers = sum(1 for r in valid_results if r.get('graham_score', 0) >= 5 and r.get('available_data_years', 0) >= 10)
 
-        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} errors")
+        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} erros")
         if error_tickers:
             analyze_logger.warning(f"Error tickers: {error_tickers}")
             error_summary = "\n".join(error_tickers)
@@ -633,6 +643,7 @@ class GrahamScreeningApp:
                 analyze_logger.warning(f"{result['ticker']} has only {years_used} years of data")
                 self.root.after(0, lambda t=result['ticker'], y=years_used: messagebox.showwarning("Insufficient Data", f"{t} has only {y} years of data. Results may be incomplete."))
             warning = f" (based on {years_used} years)" if years_used < 10 else ""
+
             price = result['price']
             buy_price = result['buy_price']
             tags = ('highlight',) if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price) else ()
@@ -951,168 +962,687 @@ class GrahamScreeningApp:
         finally:
             conn.close()
 
-    def export_nyse_qualifying_stocks(self):
+    def fetch_current_prices(self, tickers):
+        """Fetch current prices for a list of tickers using yfinance."""
+        try:
+            data = yf.download(tickers, period="1d")['Close']
+            if len(tickers) == 1:
+                return {tickers[0]: data.iloc[-1]}
+            else:
+                return data.iloc[-1].to_dict()
+        except Exception as e:
+            analyze_logger.error(f"Error fetching prices: {e}")
+            return {ticker: None for ticker in tickers}
+
+    def calculate_intrinsic_value(self, stock_dict):
+        """Calculate Graham intrinsic value using EPS and EPS CAGR."""
+        eps = stock_dict.get('eps_ttm')
+        eps_cagr = stock_dict.get('eps_cagr', 0.0)
+        if not eps or eps <= 0:
+            return float('nan')
+        aaa_yield = get_aaa_yield(FRED_API_KEY)
+        if aaa_yield <= 0:
+            return float('nan')
+        g = eps_cagr * 100  # Convert decimal to percentage
+        earnings_multiplier = min(8.5 + 2 * g, 20)  # Cap at 20
+        normalization_factor = 4.4
+        value = (eps * earnings_multiplier * normalization_factor) / (100 * aaa_yield)
+        return value
+
+    def setup_start_here_sheet(self, start_sheet):
+        # Set tab color to yellow
+        start_sheet.sheet_properties.tabColor = "FFFF00"
+
+        # Set column widths to 10 for columns A to H
+        for col in range(1, 9):
+            start_sheet.column_dimensions[get_column_letter(col)].width = 10
+
+        # Row 1: Title
+        start_sheet['A1'] = "DIRECTIONS, GENERAL NOTES, CALCULATIONS AND CONSTANTS FOR FOLLOWING SPREADSHEETS"
+        start_sheet['A1'].font = Font(bold=True, size=16)
+        start_sheet['A1'].alignment = Alignment(horizontal='left', vertical='center')
+        start_sheet.row_dimensions[1].height = 30
+
+        # Rows 3 to 8: Instructions
+        instructions = [
+            "Go to NYSE Index below and select an alphabet Letter. Click on a company name hyperlink you'd like to analyze, then click on the company name hyperlink again. This will open the Morningstar quote page for the respective company.",
+            "On the Morningstar quote page scroll down to 'financials' and click it. At the bottom of the table click 'All Financials Data.' Click the 'balance sheet' link at the top. Record 'Total Assets' and 'Total Liabilities.'",
+            "At the top of the 'All Financials Data' page, select the 'Key Ratios' tab. From the 'Financials' section, record the 'Net Income,' 'Earnings Per Share,' 'Dividends,' 'Shares,' and 'Working Capital' for the most recent year.",
+            "Staying on the 'Key Ratios' tab in the 'Key Ratios' section, record 'Return on Equity' and 'Return on Invested Capital' for the last 10 years.",
+            "Finally, remaining on the 'Key Ratios' tab, in the 'Key Ratios' section, select the 'Financial Health' tab. Scroll down to 'Long Term Debt' and enter the most recent annual number in the spreadsheet.",
+            "The spreadsheet will calculate the rest. Click save. You're done! Good job and may we get rich together!!"
+        ]
+        for i, text in enumerate(instructions, start=3):
+            start_sheet[f'A{i}'] = text
+            start_sheet[f'A{i}'].alignment = Alignment(horizontal='left', vertical='center')
+
+        # Rows 11 to 20: Tips
+        tips = [
+            "Consistently high Return on Equity shows durability; ROE = Net Income / Book Value (should be better than 12%).",
+            "Consistently high Return on Total Capital shows durability: ROTC = Net Earnings / Total Capital (should be better than 12% except for banks. Bank Return on Total Assets should be better than 1-1.5%).",
+            "Consistently high Earnings Per Share (EPS) shows durable competitive advantage: Earnings Per Share = Total Net Earnings / Number of Shares Outstanding. Should be strong and show an upward trend. Also look for an upward trend then a sharp drop. Sometimes this is a sign of a one-time oops that the market overreacts to.",
+            "Durable companies should have Long Term Debt of no more than 5 times current net earnings.",
+            "The product the company sells should be something that people use every day but wears out quickly causing repurchase.",
+            "Durable companies are not controlled by labor unionsâ€¦ try to avoid them.",
+            "Avoid companies that cannot sustain the price of their product in a down economy or a rise in inflation (i.e., airlines), good example - Coca-Cola.",
+            "Avoid companies that have to reinvest their earnings in operational costs (i.e., General Motors, Bethlehem Steel), good example - H&R Block, Wrigleys (same products forever with very little change).",
+            "Look for companies that buy back shares of their own stock. This shows they have excess cash and want to pay down debt.",
+            "Look for a company that uses its earnings to increase overall market value (i.e., Berkshire Hathaway). Look at a ten-year spread on the company's share price and its book value. If these values do not show a significant increase over the last 10 years, it is not using its earnings to increase its worth."
+        ]
+        for i, tip in enumerate(tips, start=11):
+            start_sheet[f'A{i}'] = tip
+            start_sheet[f'A{i}'].alignment = Alignment(horizontal='left', vertical='center')
+
+        # Row 22: When to sell
+        start_sheet['A22'] = "When to sell? When a company has exceeded its Intrinsic Value, it is in sell territory. If you want to hold, look at the 10-year trend on EPS. Stretch out those earnings over the next 10 years and compare them to the gain one would receive if you sold a share of the stock at the current price and invested it at the AAA Corporate bond rate for the next ten years. If you make more with the bond, it's a good time to sell the stock and look for another investment."
+        start_sheet['A22'].alignment = Alignment(horizontal='left', vertical='center')
+
+        # Row 24: AAA Corporate Bond
+        start_sheet.merge_cells('A24:B24')
+        start_sheet['A24'] = "AAA Corporate Bond"
+        start_sheet['A24'].font = Font(bold=True)
+        start_sheet['A24'].alignment = Alignment(horizontal='center', vertical='center')
+        aaa_yield = get_aaa_yield(FRED_API_KEY)
+        start_sheet['C24'] = aaa_yield
+        start_sheet['C24'].number_format = '0.00%'
+        start_sheet['C24'].alignment = Alignment(horizontal='center', vertical='center')
+
+        # Row 26: Graham Criteria for Investment Grade Stocks
+        start_sheet.merge_cells('A26:D26')
+        start_sheet['A26'] = "Graham Criteria for Investment Grade Stocks"
+        start_sheet['A26'].font = Font(bold=True)
+        start_sheet['A26'].alignment = Alignment(horizontal='center', vertical='center')
+
+        # Rows 28 to 34: Investment Grade Criteria
+        investment_criteria = [
+            "1) Adequate Size = 500 million in annual sales and 100 million in assets.",
+            "2) Strong Financially = 2:1 Current Yield.",
+            "3) 20 Years of Dividend Payment (I use 10 years for simplicity).",
+            "4) No negative Earnings Per Share over the last 10 years.",
+            "5) Earnings growth of at least 33% over last 10 years. (I use a CAGR of at least 3%).",
+            "6) Share Price <= 1.5x Net Asset Value.",
+            "7) Share Price <= 15x Average Earnings for past 3 years."
+        ]
+        for i, crit in enumerate(investment_criteria, start=28):
+            start_sheet[f'A{i}'] = crit
+            start_sheet[f'A{i}'].alignment = Alignment(horizontal='left', vertical='center')
+
+        # Row 36: Graham Criteria for Good Value Companies
+        start_sheet.merge_cells('A36:E36')
+        start_sheet['A36'] = "Graham criteria for good value companies. 7/10 is goal."
+        start_sheet['A36'].font = Font(bold=True)
+        start_sheet['A36'].alignment = Alignment(horizontal='center', vertical='center')
+
+        # Rows 38 to 47: Value Company Criteria
+        value_criteria = [
+            "1) Earnings/Price ratio = 2x AAA Corporate Bond Yield.",
+            "2) Price/Earnings ratio = .4 of highest P/E average of the last 10 years.",
+            "3) Dividend Yield >= 2/3 of AAA Bond Yield.",
+            "4) Share Price = 2/3 Tangible Book Value per Share.",
+            "5) 2/3 Net Current Asset Value.",
+            "6) Total Debt Lower than Tangible Book Value.",
+            "7) Current Ratio >= 2.",
+            "8) Total Debt <= Net Quick Liquidation Value.",
+            "9) Earnings have doubled in the last 10 years.",
+            "10) Earnings have declined no more than 5% in the last 10 years."
+        ]
+        for i, crit in enumerate(value_criteria, start=38):
+            start_sheet[f'A{i}'] = crit
+            start_sheet[f'A{i}'].alignment = Alignment(horizontal='left', vertical='center')
+
+        # Disable text wrapping for all rows
+        for row in start_sheet.iter_rows():
+            for cell in row:
+                if cell.row in [24, 26, 36]:
+                    cell.alignment = Alignment(wrap_text=False, horizontal='center', vertical='center')
+                else:
+                    cell.alignment = Alignment(wrap_text=False, horizontal='left', vertical='center')
+
+    def export_qualifying_stocks(self, exchange):
+        """Export qualifying stocks to an Excel workbook with specified formatting."""
         conn, cursor = get_stocks_connection()
         try:
+            # Fetch qualifying tickers and data including eps_cagr
             cursor.execute(""" 
-                SELECT ticker, company_name, common_score 
-                FROM stocks 
-                WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NYSE')
-            """)
-            results = cursor.fetchall()
-
-            if not results:
-                messagebox.showinfo("No Data", "No NYSE qualifying stocks to export.")
-                analyze_logger.info("No NYSE qualifying stocks found for export.")
+                SELECT g.ticker, g.sector, g.common_score, s.company_name, s.years, s.roe, s.rotc, s.eps, s.dividend,
+                       s.debt_to_equity, s.eps_ttm, s.book_value_per_share, s.latest_revenue, s.available_data_years, s.balance_data,
+                       s.latest_net_income, s.latest_long_term_debt, s.eps_cagr
+                FROM graham_qualifiers g
+                LEFT JOIN stocks s ON g.ticker = s.ticker
+                WHERE g.exchange=?
+            """, (exchange,))
+            qualifiers = cursor.fetchall()
+            if not qualifiers:
+                messagebox.showinfo("No Data", f"No {exchange} qualifying stocks to export.")
                 return
 
-            df = pd.DataFrame(results, columns=["Ticker", "Company Name", "Common Score"])
+            tickers = [row[0] for row in qualifiers]
+            prices = self.fetch_current_prices(tickers)
 
-            file_path = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv")],
-                title="Save NYSE Qualifying Stocks"
-            )
+            # Create workbook
+            wb = openpyxl.Workbook()
 
+            # "Start Here" sheet
+            start_sheet = wb.active
+            start_sheet.title = "Start Here"
+            self.setup_start_here_sheet(start_sheet)
+
+            # Process stock data for summary tabs
+            stock_data_list = []
+            for row in qualifiers:
+                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr = row
+                price = prices.get(ticker, "N/A")
+                if price == "N/A" or not isinstance(price, (int, float)):
+                    continue  # Skip stocks without valid price data
+                try:
+                    eps_list = [float(x) for x in eps.split(",")] if eps else []
+                    div_list = [float(x) for x in dividend.split(",")] if dividend else []
+                    balance_data_dict = json.loads(balance_data) if balance_data else []
+                except Exception as e:
+                    analyze_logger.error(f"Error parsing data for {ticker}: {e}")
+                    continue
+
+                intrinsic_value = self.calculate_intrinsic_value({'eps_ttm': eps_ttm, 'eps_cagr': eps_cagr})
+                if pd.isna(intrinsic_value) or intrinsic_value == 0:
+                    margin_of_safety = "N/A"
+                else:
+                    margin_of_safety = (intrinsic_value - price) / intrinsic_value * 100  # Percent current price is below/above intrinsic value
+                expected_return = self.expected_return_var.get() / 100
+                buy_price = intrinsic_value * (1 - (self.margin_of_safety_var.get() / 100)) if not pd.isna(intrinsic_value) else "N/A"
+                sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else "N/A"
+                graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data_dict, available_data_years, latest_revenue)
+
+                stock_data = {
+                    "company_name": company_name,
+                    "ticker": ticker,
+                    "sector": sector,
+                    "mos": margin_of_safety if margin_of_safety != "N/A" else "N/A",
+                    "graham_score": graham_score if graham_score is not None else "N/A",
+                    "current_price": price,
+                    "intrinsic_value": intrinsic_value if not pd.isna(intrinsic_value) else "N/A",
+                    "buy_price": buy_price if buy_price != "N/A" else "N/A",
+                    "sell_price": sell_price if sell_price != "N/A" else "N/A"
+                }
+                stock_data_list.append(stock_data)
+
+            # Sort stock data list by company name
+            stock_data_list.sort(key=lambda x: x["company_name"])
+
+            # Define financial sectors (adjust based on actual sector names in your data)
+            financial_sectors = ['Financial Services', 'Finance', 'Banking', 'financials']
+
+            # Make case-insensitive comparison
+            financial_sectors_lower = [s.lower() for s in financial_sectors]
+            financial_stocks = [stock for stock in stock_data_list if stock['sector'].lower() in financial_sectors_lower]
+            other_stocks = [stock for stock in stock_data_list if stock['sector'].lower() not in financial_sectors_lower]
+
+            # Headers for summary sheets
+            headers = ["Company Name", "Ticker", "Sector", "MOS", "Graham Score", "Current Price", "Intrinsic Value", "Buy Price", "Sell Price"]
+
+            # Function to create a summary sheet
+            def create_summary_sheet(sheet_name, stocks):
+                sheet = wb.create_sheet(sheet_name)
+                for col, header in enumerate(headers, start=1):
+                    cell = sheet.cell(row=1, column=col, value=header)
+                    cell.font = Font(size=12, bold=True)
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                for row_idx, stock in enumerate(stocks, start=2):
+                    company_cell = sheet.cell(row=row_idx, column=1, value=stock["company_name"])
+                    company_cell.hyperlink = f"#'{stock['ticker']}'!A1"
+                    company_cell.style = "Hyperlink"
+                    sheet.cell(row=row_idx, column=2, value=stock["ticker"])
+                    sheet.cell(row=row_idx, column=3, value=stock["sector"])
+                    sheet.cell(row=row_idx, column=4, value=stock["mos"] / 100 if stock["mos"] != "N/A" else "N/A")
+                    sheet.cell(row=row_idx, column=5, value=stock["graham_score"] if stock["graham_score"] != "N/A" else "N/A")
+                    sheet.cell(row=row_idx, column=6, value=stock["current_price"] if stock["current_price"] != "N/A" else "N/A")
+                    sheet.cell(row=row_idx, column=7, value=stock["intrinsic_value"] if stock["intrinsic_value"] != "N/A" else "N/A")
+                    sheet.cell(row=row_idx, column=8, value=stock["buy_price"] if stock["buy_price"] != "N/A" else "N/A")
+                    sheet.cell(row=row_idx, column=9, value=stock["sell_price"] if stock["sell_price"] != "N/A" else "N/A")
+
+                # Set number formats
+                for row in range(2, len(stocks) + 2):
+                    sheet.cell(row=row, column=4).number_format = '0.00%'  # MOS as percentage
+                    sheet.cell(row=row, column=5).number_format = '0'  # Graham Score as integer
+                    for col in range(6, 10):  # Currency columns
+                        if sheet.cell(row=row, column=col).value != "N/A":
+                            sheet.cell(row=row, column=col).number_format = '$#,##0.00'
+
+                # Set column widths
+                column_widths = [55, 12, 25, 12, 15, 18, 20, 15, 15]
+                for col, width in enumerate(column_widths, start=1):
+                    sheet.column_dimensions[get_column_letter(col)].width = width
+
+                # Set alignment
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Add auto_filter with sort on column A
+                sheet.auto_filter.ref = f"A1:I{len(stocks) + 1}"
+                sheet.auto_filter.add_sort_condition(f"A2:A{len(stocks) + 1}")
+
+            # Create 'Winning Stocks' sheet for non-financial stocks
+            if other_stocks:
+                create_summary_sheet("Winning Stocks", other_stocks)
+                print(f"Created 'Winning Stocks' sheet with {len(other_stocks)} stocks")
+
+            # Create 'Financial Winners' sheet for financial stocks
+            if financial_stocks:
+                create_summary_sheet("Financial Winners", financial_stocks)
+                print(f"Created 'Financial Winners' sheet with {len(financial_stocks)} stocks")
+            else:
+                print("No financial stocks to create 'Financial Winners' sheet")
+
+            # Sort qualifiers by ticker for individual sheets
+            qualifiers.sort(key=lambda x: x[0])  # Assuming ticker is the first element
+
+            # Create individual stock sheets
+            for row in qualifiers:
+                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr = row
+                price = prices.get(ticker, "N/A")
+                stock_sheet = wb.create_sheet(ticker)
+
+                # Set row heights to 15 for rows 1 to 50
+                for row_num in range(1, 51):
+                    stock_sheet.row_dimensions[row_num].height = 15
+
+                # Merge cells A2:K3 for company name and ticker
+                stock_sheet.merge_cells('A2:K3')
+                company_ticker_cell = stock_sheet['A2']
+                company_ticker_cell.value = f"{company_name.upper()} ({ticker})"
+                company_ticker_cell.font = Font(bold=True, size=18)
+                company_ticker_cell.alignment = Alignment(horizontal='center', vertical='center')
+                company_ticker_cell.hyperlink = f"https://www.morningstar.com/stocks/xnys/{ticker}/quote"
+
+                # Set column widths
+                stock_sheet.column_dimensions['A'].width = 25
+                for col in range(2, 13):  # B to L
+                    stock_sheet.column_dimensions[get_column_letter(col)].width = 10
+                stock_sheet.column_dimensions['M'].width = 15
+                stock_sheet.column_dimensions['N'].width = 10
+                stock_sheet.column_dimensions['O'].width = 15
+
+                # Determine last updated date and format as "31-May-25"
+                ticker_file = NYSE_LIST_FILE if exchange == "NYSE" else NASDAQ_LIST_FILE
+                if os.path.exists(ticker_file):
+                    last_updated = datetime.fromtimestamp(os.path.getmtime(ticker_file)).strftime('%d-%b-%y')
+                else:
+                    last_updated = "Unknown"
+
+                # Merge L1:N1 for "Last Updated:"
+                stock_sheet.merge_cells('L1:N1')
+                last_updated_label = stock_sheet['L1']
+                last_updated_label.value = "Last Updated:"
+                last_updated_label.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set O1 to last updated date
+                stock_sheet['O1'].value = last_updated
+                stock_sheet['O1'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Fetch AAA yield
+                aaa_yield = get_aaa_yield(FRED_API_KEY)
+
+                # Calculate P/E ratio
+                if isinstance(price, (int, float)) and eps_ttm and eps_ttm > 0:
+                    pe_ratio = price / eps_ttm
+                else:
+                    pe_ratio = "N/A"
+
+                # Set L2: current price
+                cell_l2 = stock_sheet['L2']
+                if isinstance(price, (int, float)):
+                    cell_l2.value = price
+                    cell_l2.number_format = '$#,##0.00'
+                else:
+                    cell_l2.value = "N/A"
+                cell_l2.font = Font(bold=True)
+                cell_l2.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set M2: "Current Price"
+                cell_m2 = stock_sheet['M2']
+                cell_m2.value = "Current Price"
+                cell_m2.font = Font(bold=True)
+                cell_m2.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set N2: P/E ratio
+                cell_n2 = stock_sheet['N2']
+                if isinstance(pe_ratio, (int, float)):
+                    cell_n2.value = pe_ratio
+                    cell_n2.number_format = '0.00'
+                else:
+                    cell_n2.value = "N/A"
+                cell_n2.font = Font(bold=True)
+                cell_n2.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set O2: "P/E Ratio"
+                cell_o2 = stock_sheet['O2']
+                cell_o2.value = "P/E Ratio"
+                cell_o2.font = Font(bold=True)
+                cell_o2.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set L3: AAA yield
+                cell_l3 = stock_sheet['L3']
+                if isinstance(aaa_yield, (int, float)):
+                    cell_l3.value = aaa_yield
+                    cell_l3.number_format = '0.00%'
+                else:
+                    cell_l3.value = "N/A"
+                cell_l3.font = Font(bold=True)
+                cell_l3.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Merge M3:O3 and set "AAA Corporate Bond Rate"
+                stock_sheet.merge_cells('M3:O3')
+                cell_m3 = stock_sheet['M3']
+                cell_m3.value = "AAA Corporate Bond Rate"
+                cell_m3.font = Font(bold=True)
+                cell_m3.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set bold borders
+                bold_side = Side(style='thick')
+                thin_side = Side(style='thin')
+
+                cell_l2.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=thin_side)
+                cell_m2.border = Border(top=bold_side, right=bold_side, bottom=bold_side, left=thin_side)
+                cell_n2.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=thin_side)
+                cell_o2.border = Border(top=bold_side, right=bold_side, bottom=bold_side, left=thin_side)
+                cell_l3.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=bold_side)
+                cell_m3.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=bold_side)
+
+                # Define labels with Unicode subscripts
+                sub_1 = '\u2081'
+                sub_0 = '\u2080'
+                sub_10 = sub_1 + sub_0
+                labels = [
+                    "Year",
+                    f"ROE{sub_10}",
+                    f"ROTC{sub_10}",
+                    f"EPS{sub_10}",
+                    f"EPS{sub_10} % Change",
+                    f"EPS{sub_10} Proj",
+                    f"DIV{sub_10}",
+                    f"DIV{sub_10} % Change",
+                    f"DIV{sub_10} Proj"
+                ]
+
+                # Set labels in A4:A12 and M4:M12
+                for i, label in enumerate(labels):
+                    row_num = 4 + i
+                    cell_a = stock_sheet[f'A{row_num}']
+                    cell_m = stock_sheet[f'M{row_num}']
+                    cell_a.value = label
+                    cell_m.value = label
+                    cell_a.font = Font(size=10, bold=True)
+                    cell_m.font = Font(size=10, bold=True)
+                    cell_a.alignment = Alignment(horizontal='center', vertical='center')
+                    cell_m.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Parse historical data
+                years_list = [int(y) for y in years.split(",")] if years else []
+                roe_list = [float(x) for x in roe.split(",")] if roe else []
+                rotc_list = [float(x) for x in rotc.split(",")] if rotc else []
+                eps_list = [float(x) for x in eps.split(",")] if eps else []
+                div_list = [float(x) for x in dividend.split(",")] if dividend else []
+
+                # Take the last 10 years
+                years_list = years_list[-10:]
+                roe_list = roe_list[-10:]
+                rotc_list = rotc_list[-10:]
+                eps_list = eps_list[-10:]
+                div_list = div_list[-10:]
+
+                # Populate B4:K4 with years (bold)
+                for col, year in enumerate(years_list, start=2):  # B to K
+                    cell = stock_sheet.cell(row=4, column=col)
+                    cell.value = year
+                    cell.font = Font(bold=True)
+
+                # Populate B5:K5 with ROE (as decimal)
+                for col, roe_value in enumerate(roe_list, start=2):
+                    cell = stock_sheet.cell(row=5, column=col)
+                    if col-2 < len(roe_list):
+                        cell.value = roe_value / 100 if isinstance(roe_value, (int, float)) else "N/A"
+                    else:
+                        cell.value = "N/A"
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '0.00%'
+
+                # Populate B6:K6 with ROTC (as decimal)
+                for col, rotc_value in enumerate(rotc_list, start=2):
+                    cell = stock_sheet.cell(row=6, column=col)
+                    if col-2 < len(rotc_list):
+                        cell.value = rotc_value / 100 if isinstance(rotc_value, (int, float)) else "N/A"
+                    else:
+                        cell.value = "N/A"
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '0.00%'
+
+                # Populate B7:K7 with EPS
+                for col, eps_value in enumerate(eps_list, start=2):
+                    cell = stock_sheet.cell(row=7, column=col)
+                    cell.value = eps_value if col-2 < len(eps_list) else "N/A"
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '$#,##0.00'
+
+                # Calculate EPS % Change in C8:K8
+                for col in range(3, 12):  # C to K
+                    prev_eps = stock_sheet.cell(row=7, column=col-1).value
+                    current_eps = stock_sheet.cell(row=7, column=col).value
+                    if isinstance(prev_eps, (int, float)) and isinstance(current_eps, (int, float)) and prev_eps != 0:
+                        change = (current_eps - prev_eps) / prev_eps
+                        stock_sheet.cell(row=8, column=col).value = change
+                        stock_sheet.cell(row=8, column=col).number_format = '0.00%'
+                    else:
+                        stock_sheet.cell(row=8, column=col).value = "N/A"
+
+                # Populate B10:K10 with Dividends
+                for col, div_value in enumerate(div_list, start=2):
+                    cell = stock_sheet.cell(row=10, column=col)
+                    cell.value = div_value if col-2 < len(div_list) else "N/A"
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '$#,##0.00'
+
+                # Calculate Dividend % Change in C11:K11
+                for col in range(3, 12):  # C to K
+                    prev_div = stock_sheet.cell(row=10, column=col-1).value
+                    current_div = stock_sheet.cell(row=10, column=col).value
+                    if isinstance(prev_div, (int, float)) and isinstance(current_div, (int, float)) and prev_div != 0:
+                        change = (current_div - prev_div) / prev_div
+                        stock_sheet.cell(row=11, column=col).value = change
+                        stock_sheet.cell(row=11, column=col).number_format = '0.00%'
+                    else:
+                        stock_sheet.cell(row=11, column=col).value = "N/A"
+
+                # Set L4 to "Avgâ‚â‚€"
+                stock_sheet['L4'].value = f"Avg{sub_10}"
+                stock_sheet['L4'].font = Font(bold=True)
+                stock_sheet['L4'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set averages using Excel formulas for L5:L12
+                stock_sheet['L5'].value = "=AVERAGE(B5:K5)"
+                stock_sheet['L5'].number_format = '0.00%'
+                stock_sheet['L6'].value = "=AVERAGE(B6:K6)"
+                stock_sheet['L6'].number_format = '0.00%'
+                stock_sheet['L7'].value = "=AVERAGE(B7:K7)"
+                stock_sheet['L7'].number_format = '$#,##0.00'
+                stock_sheet['L8'].value = "=AVERAGE(B8:K8)"
+                stock_sheet['L8'].number_format = '0.00%'
+                stock_sheet['L9'].value = "=AVERAGE(B9:K9)"
+                stock_sheet['L9'].number_format = '$#,##0.00'
+                stock_sheet['L10'].value = "=AVERAGE(B10:K10)"
+                stock_sheet['L10'].number_format = '$#,##0.00'
+                stock_sheet['L11'].value = "=AVERAGE(B11:K11)"
+                stock_sheet['L11'].number_format = '0.00%'
+                stock_sheet['L12'].value = "=AVERAGE(B12:K12)"
+                stock_sheet['L12'].number_format = '$#,##0.00'
+
+                # Set EPS projections
+                stock_sheet['B9'].value = f"={get_column_letter(11)}7 * (1 + {get_column_letter(12)}8)"
+                stock_sheet['B9'].number_format = '$#,##0.00'
+                for col in range(3, 12):  # C to K
+                    prev_col_letter = get_column_letter(col - 1)
+                    stock_sheet.cell(row=9, column=col).value = f"={prev_col_letter}9 * (1 + ${get_column_letter(12)}$8)"
+                    stock_sheet.cell(row=9, column=col).number_format = '$#,##0.00'
+
+                # Set Dividend projections
+                stock_sheet['B12'].value = f"={get_column_letter(11)}10 * (1 + {get_column_letter(12)}11)"
+                stock_sheet['B12'].number_format = '$#,##0.00'
+                for col in range(3, 12):  # C to K
+                    prev_col_letter = get_column_letter(col - 1)
+                    stock_sheet.cell(row=12, column=col).value = f"={prev_col_letter}12 * (1 + ${get_column_letter(12)}$11)"
+                    stock_sheet.cell(row=12, column=col).number_format = '$#,##0.00'
+
+                # Row 13
+                stock_sheet['A13'].value = "Long Term Debt ($M)"
+                stock_sheet['A13'].font = Font(bold=True)
+                stock_sheet['A13'].alignment = Alignment(horizontal='center', vertical='center')
+
+                if latest_long_term_debt is not None:
+                    stock_sheet['B13'].value = latest_long_term_debt / 1_000_000
+                    stock_sheet['B13'].number_format = '$#,##0'
+                else:
+                    stock_sheet['B13'].value = "N/A"
+
+                stock_sheet.merge_cells('C13:D13')
+                stock_sheet['C13'].value = "Net Income ($M)"
+                stock_sheet['C13'].font = Font(bold=True)
+                stock_sheet['C13'].alignment = Alignment(horizontal='center', vertical='center')
+
+                if latest_net_income is not None:
+                    stock_sheet['E13'].value = latest_net_income / 1_000_000
+                    stock_sheet['E13'].number_format = '$#,##0'
+                else:
+                    stock_sheet['E13'].value = "N/A"
+
+                stock_sheet['F13'].value = "LTD/NI"
+                stock_sheet['F13'].font = Font(bold=True)
+                stock_sheet['F13'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['G13'].value = "=IF(E13=0, \"N/A\", B13/E13)"
+                stock_sheet['G13'].number_format = '0.00'
+
+                # Set alignment for row 13
+                for col in ['A', 'B', 'C', 'E', 'F', 'G']:
+                    stock_sheet[f'{col}13'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Center B4:L12 horizontally and vertically
+                for row in range(4, 13):
+                    for col in range(2, 13):  # B to L
+                        cell = stock_sheet.cell(row=row, column=col)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+            # Save the workbook
+            file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], initialfile=f"{exchange}_Qualifying_Stocks.xlsx")
             if file_path:
-                df.to_csv(file_path, index=False)
-                messagebox.showinfo("Export Successful", f"NYSE qualifying stocks exported to {file_path}")
-                analyze_logger.info(f"Exported {len(results)} NYSE qualifying stocks to {file_path}")
-
-        except sqlite3.Error as e:
-            analyze_logger.error(f"Database error in export_nyse_qualifying_stocks: {str(e)}")
-            messagebox.showerror("Error", f"Database error: {str(e)}")
+                wb.save(file_path)
+                messagebox.showinfo("Export Successful", f"Qualifying stocks exported to {file_path}")
+        except Exception as e:
+            analyze_logger.error(f"Error exporting qualifying stocks: {e}")
+            messagebox.showerror("Export Error", f"An error occurred while exporting: {str(e)}")
         finally:
             conn.close()
+
+    def export_nyse_qualifying_stocks(self):
+        self.export_qualifying_stocks("NYSE")
 
     def export_nasdaq_qualifying_stocks(self):
-        conn, cursor = get_stocks_connection()
-        try:
-            cursor.execute(""" 
-                SELECT ticker, company_name, common_score 
-                FROM stocks 
-                WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NASDAQ')
-            """)
-            results = cursor.fetchall()
-            if not results:
-                messagebox.showinfo("No Data", "No NASDAQ qualifying stocks to export.")
-                return
+        self.export_qualifying_stocks("NASDAQ")
 
-            df = pd.DataFrame(results, columns=["Ticker", "Company Name", "Common Score"])
-            file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-            if file_path:
-                df.to_csv(file_path, index=False)
-                messagebox.showinfo("Export Successful", f"NASDAQ qualifying stocks exported to {file_path}")
-        except sqlite3.Error as e:
-            analyze_logger.error(f"Database error in export_nasdaq_qualifying_stocks: {str(e)}")
-            messagebox.showerror("Error", f"Database error: {str(e)}")
-        finally:
-            conn.close()
+    def check_file_age(self):
+        files = [
+            ("NYSE List", NYSE_LIST_FILE),
+            ("NASDAQ List", NASDAQ_LIST_FILE),
+            ("Favorites", FAVORITES_FILE)
+        ]
+        messages = []
+        for name, file_path in files:
+            if os.path.exists(file_path):
+                age_days = (time.time() - os.path.getmtime(file_path)) / (24 * 3600)
+                messages.append(f"{name}: {age_days:.1f} days old")
+            else:
+                messages.append(f"{name}: File not found")
+        messagebox.showinfo("File Ages", "\n".join(messages))
 
-    def safe_insert(self, widget, text):
-        self.root.after(0, lambda: widget.insert(tk.END, text))
+    def update_ticker_files(self):
+        if messagebox.askyesno("Confirm Update", "This will download the latest NYSE and NASDAQ ticker files from FTP. Continue?"):
+            def on_complete():
+                self.root.after(0, lambda: messagebox.showinfo("Update Complete", "Ticker files have been updated from FTP."))
+            def on_error():
+                self.root.after(0, lambda: messagebox.showerror("Update Failed", "Failed to download ticker files. Check logs for details."))
+            async def update_task():
+                try:
+                    await self.ticker_manager.download_ticker_files()
+                    on_complete()
+                except Exception:
+                    on_error()
+            self.task_queue.put(update_task())
+            messagebox.showinfo("Update Started", "Ticker files update has been queued.")
 
     def clear_cache(self):
-        conn, cursor = get_stocks_connection()
-        try:
-            cursor.execute("DELETE FROM stocks")
-            cursor.execute("DELETE FROM screening_progress")
-            cursor.execute("DELETE FROM graham_qualifiers")
-            conn.commit()
-            with self.ticker_cache_lock:
-                self.ticker_cache.clear()
+        if messagebox.askyesno("Confirm Clear Cache", "This will clear all cached data. Continue?"):
             clear_in_memory_caches()
-            messagebox.showinfo("Cache Cleared", "All caches have been cleared.")
-            analyze_logger.info("All caches cleared successfully.")
-        except sqlite3.Error as e:
-            analyze_logger.error(f"Error clearing cache: {str(e)}")
-            messagebox.showerror("Error", f"Failed to clear cache: {str(e)}")
-        finally:
-            conn.close()
+            conn, cursor = get_stocks_connection()
+            try:
+                cursor.execute("DELETE FROM stocks")
+                cursor.execute("DELETE FROM screening_progress")
+                conn.commit()
+                messagebox.showinfo("Cache Cleared", "All cached data has been cleared.")
+            except sqlite3.Error as e:
+                messagebox.showerror("Error", f"Failed to clear database cache: {str(e)}")
+            finally:
+                conn.close()
 
     def show_help(self):
-        help_text = (
-            "Graham Defensive Stock Screener\n\n"
-            "1. Enter tickers in the left column (e.g., AOS, AAPL) and click 'Analyze Stocks'.\n"
-            "2. Use 'Save Favorite' to store ticker lists and 'Manage Favorites' to edit them.\n"
-            "3. Adjust Margin of Safety and Expected Return using sliders.\n"
-            "4. Run NYSE or NASDAQ screenings via checkboxes and buttons in the middle/right columns. Stocks must meet all 6 Graham criteria to qualify.\n"
-            "5. View results in the treeview below; select a stock to see historical data and metrics.\n"
-            "6. Export qualifying stocks to CSV using the export buttons.\n"
-            "7. Clear cache to refresh all data.\n"
-            "8. Check ticker file ages and update them with new buttons.\n\n"
-            "Note: Requires internet connection and valid FMP API keys in config.py."
-        )
+        help_text = """
+        Graham Screening App Help:
+
+        - **Analyze Stocks**: Enter tickers (e.g., AOS, AAPL) and click "Analyze Stocks" to evaluate them against Graham's criteria.
+        - **Favorites**: Save and load ticker lists using the "Save Favorite" and "Favorite Lists" dropdown.
+        - **Screening**: Check NYSE or NASDAQ screening boxes and run to find qualifying stocks.
+        - **Export**: Export qualifying stocks to Excel after screening.
+        - **Progress**: Monitor screening progress and cache usage in the middle panel.
+        - **Tabs**: Select a stock in the treeview to see historical data and metrics below.
+
+        For detailed instructions, see the exported Excel's "Start Here" sheet.
+        """
         messagebox.showinfo("Help", help_text)
 
     def filter_tree(self, event):
+        """Filter the treeview based on the search term entered in the search entry widget."""
         search_term = self.search_entry.get().strip().upper()
+        
+        # Clear the current treeview contents
         for item in self.tree.get_children():
             self.tree.delete(item)
-
+        
+        # Connect to the database
         conn, cursor = get_stocks_connection()
         try:
+            # If there's a search term, filter stocks by ticker; otherwise, show all stocks
             if search_term:
-                cursor.execute("SELECT ticker, company_name, common_score FROM stocks WHERE ticker LIKE ?", (f"%{search_term}%",))
+                cursor.execute(
+                    "SELECT ticker, company_name, common_score FROM stocks WHERE ticker LIKE ?",
+                    (f"%{search_term}%",)
+                )
             else:
                 cursor.execute("SELECT ticker, company_name, common_score FROM stocks")
+            
             results = cursor.fetchall()
-
+            
+            # Populate the treeview with filtered results
             for ticker, company_name, common_score in results:
-                self.tree.insert("", "end", text=ticker, values=(company_name, "Unknown", f"{common_score}/6", "", "", "", ""))
+                self.tree.insert(
+                    "", "end", text=ticker,
+                    values=(company_name, "Unknown", f"{common_score}/6", "", "", "", "")
+                )
         except sqlite3.Error as e:
             analyze_logger.error(f"Database error in filter_tree: {str(e)}")
         finally:
             conn.close()
 
-    def check_file_age(self):
-        nyse_age = (time.time() - os.path.getmtime(NYSE_LIST_FILE)) / (24 * 3600) if os.path.exists(NYSE_LIST_FILE) else float('inf')
-        nasdaq_age = (time.time() - os.path.getmtime(NASDAQ_LIST_FILE)) / (24 * 3600) if os.path.exists(NASDAQ_LIST_FILE) else float('inf')
-        messagebox.showinfo("File Ages", f"NYSE file (otherlisted.txt) is {nyse_age:.1f} days old.\nNASDAQ file (nasdaqlisted.txt) is {nasdaq_age:.1f} days old.")
-
-    def update_ticker_files(self):
-        async def async_update():
-            ftp_host = "ftp.nasdaqtrader.com"
-            files_to_update = {
-                "otherlisted.txt": NYSE_LIST_FILE,
-                "nasdaqlisted.txt": NASDAQ_LIST_FILE
-            }
-            for remote_file, local_file in files_to_update.items():
-                try:
-                    ftp = ftplib.FTP(ftp_host)
-                    ftp.login()
-                    with open(local_file, 'wb') as f:
-                        ftp.retrbinary(f'RETR /SymbolDirectory/{remote_file}', f.write)
-                    ftp.quit()
-                    analyze_logger.info(f"Updated {local_file} from FTP")
-                except Exception as e:
-                    analyze_logger.error(f"Failed to update {local_file}: {str(e)}")
-                    self.root.after(0, lambda: messagebox.showerror("Update Error", f"Failed to update {local_file}: {str(e)}"))
-                    return
-            await self.ticker_manager.initialize()
-            self.root.after(0, lambda: messagebox.showinfo("Update Complete", "Ticker files updated successfully."))
-        self.task_queue.put(async_update())
-
-    def on_closing(self):
-        self.cancel_event.set()
-        self.task_queue.put(None)
-        self.asyncio_thread.join(timeout=2)
-        with self.ticker_cache_lock:
-            self.ticker_cache.clear()
-        # Close logging handlers
-        for handler in screening_logger.handlers[:]:
-            handler.close()
-            screening_logger.removeHandler(handler)
-        for handler in analyze_logger.handlers[:]:
-            handler.close()
-            analyze_logger.removeHandler(handler)
-        for handler in logging.getLogger().handlers[:]:
-            handler.close()
-            logging.getLogger().removeHandler(handler)
-        self.root.destroy()
+    def safe_insert(self, text_widget, content):
+        self.root.after(0, lambda: text_widget.insert(tk.END, content))
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = GrahamScreeningApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
