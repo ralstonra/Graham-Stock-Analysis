@@ -1,1 +1,2 @@
--e "*.log\napi_cache.db\nstock_favorites.json\nstock_favorites.json.bak\notherlisted.txt\nnasdaqlisted.txt\nNYSE Invalid Tickers.txt\nNASDAQ Invalid Tickers.txt\n*.pyc\n__pycache__/\n.vscode/\nfmp_responses/" 
+"__pycache__/" 
+"*.pyc" 
