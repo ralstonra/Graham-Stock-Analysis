@@ -28,7 +28,7 @@ import ftplib
 import openpyxl
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 FAVORITES_LOCK = threading.Lock()
 DATA_DIR = BASE_DIR
@@ -217,6 +217,12 @@ class GrahamScreeningApp:
         ttk.Button(self.right_frame, text="Show NASDAQ Qualifying Stocks", command=self.display_nasdaq_qualifying_stocks).grid(row=7, column=0, pady=2, sticky="ew")
         ttk.Button(self.right_frame, text="Export NASDAQ Qualifying Stocks", command=self.export_nasdaq_qualifying_stocks).grid(row=8, column=0, pady=2, sticky="ew")
 
+        # Add minimum criteria selector
+        self.min_criteria_var = tk.IntVar(value=6)
+        ttk.Label(self.right_frame, text="Min Graham Criteria:").grid(row=9, column=0, pady=2, sticky="w")
+        self.min_criteria_menu = ttk.Combobox(self.right_frame, textvariable=self.min_criteria_var, values=[4, 5, 6], state="readonly")
+        self.min_criteria_menu.grid(row=10, column=0, pady=2, sticky="ew")
+
         # Treeview and Tabs
         self.full_tree_frame = ttk.Frame(self.main_frame)
         self.full_tree_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
@@ -393,6 +399,7 @@ class GrahamScreeningApp:
         self.cancel_event.clear()
         self.screening_active = True
 
+        min_criteria = self.min_criteria_var.get()
         async def screening_task():
             try:
                 await self.ticker_manager.initialize()
@@ -403,7 +410,8 @@ class GrahamScreeningApp:
                     update_progress_animated=self.update_progress_animated,
                     refresh_favorites_dropdown=self.refresh_favorites_dropdown,
                     ticker_manager=self.ticker_manager,
-                    update_rate_limit=self.update_rate_limit
+                    update_rate_limit=self.update_rate_limit,
+                    min_criteria=min_criteria  # Pass the selected threshold
                 )
                 screening_logger.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
                 if not self.cancel_event.is_set():
@@ -626,7 +634,7 @@ class GrahamScreeningApp:
         valid_results = [r for r in results if 'error' not in r]
         passed_tickers = sum(1 for r in valid_results if r.get('graham_score', 0) >= 5 and r.get('available_data_years', 0) >= 10)
 
-        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} erros")
+        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} errors")
         if error_tickers:
             analyze_logger.warning(f"Error tickers: {error_tickers}")
             error_summary = "\n".join(error_tickers)
@@ -1023,7 +1031,7 @@ class GrahamScreeningApp:
             "Consistently high Earnings Per Share (EPS) shows durable competitive advantage: Earnings Per Share = Total Net Earnings / Number of Shares Outstanding. Should be strong and show an upward trend. Also look for an upward trend then a sharp drop. Sometimes this is a sign of a one-time oops that the market overreacts to.",
             "Durable companies should have Long Term Debt of no more than 5 times current net earnings.",
             "The product the company sells should be something that people use every day but wears out quickly causing repurchase.",
-            "Durable companies are not controlled by labor unionsâ€¦ try to avoid them.",
+            "Durable companies are not controlled by labor unions try to avoid them.",
             "Avoid companies that cannot sustain the price of their product in a down economy or a rise in inflation (i.e., airlines), good example - Coca-Cola.",
             "Avoid companies that have to reinvest their earnings in operational costs (i.e., General Motors, Bethlehem Steel), good example - H&R Block, Wrigleys (same products forever with very little change).",
             "Look for companies that buy back shares of their own stock. This shows they have excess cash and want to pay down debt.",
@@ -1100,13 +1108,21 @@ class GrahamScreeningApp:
 
     def export_qualifying_stocks(self, exchange):
         """Export qualifying stocks to an Excel workbook with specified formatting."""
+        import json  # Ensure json is imported for parsing raw_income_data
+        from openpyxl.chart import ScatterChart, Series, Reference
+        from openpyxl.chart.marker import Marker
+        from openpyxl.chart.shapes import GraphicalProperties
+        from openpyxl.chart.axis import ChartLines
+
         conn, cursor = get_stocks_connection()
         try:
-            # Fetch qualifying tickers and data including eps_cagr
+            # Fetch qualifying tickers and data including additional fields
             cursor.execute(""" 
                 SELECT g.ticker, g.sector, g.common_score, s.company_name, s.years, s.roe, s.rotc, s.eps, s.dividend,
-                       s.debt_to_equity, s.eps_ttm, s.book_value_per_share, s.latest_revenue, s.available_data_years, s.balance_data,
-                       s.latest_net_income, s.latest_long_term_debt, s.eps_cagr
+                    s.debt_to_equity, s.eps_ttm, s.book_value_per_share, s.latest_revenue, s.available_data_years, s.balance_data,
+                    s.latest_net_income, s.latest_long_term_debt, s.eps_cagr, s.latest_total_assets, s.latest_total_liabilities,
+                    s.latest_shares_outstanding, s.latest_current_assets, s.latest_current_liabilities, s.raw_income_data,
+                    s.key_metrics_data, s.latest_short_term_debt, s.latest_book_value
                 FROM graham_qualifiers g
                 LEFT JOIN stocks s ON g.ticker = s.ticker
                 WHERE g.exchange=?
@@ -1130,7 +1146,7 @@ class GrahamScreeningApp:
             # Process stock data for summary tabs
             stock_data_list = []
             for row in qualifiers:
-                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr = row
+                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_current_assets, latest_current_liabilities, raw_income_data, key_metrics_data, latest_short_term_debt, latest_book_value = row
                 price = prices.get(ticker, "N/A")
                 if price == "N/A" or not isinstance(price, (int, float)):
                     continue  # Skip stocks without valid price data
@@ -1161,7 +1177,13 @@ class GrahamScreeningApp:
                     "current_price": price,
                     "intrinsic_value": intrinsic_value if not pd.isna(intrinsic_value) else "N/A",
                     "buy_price": buy_price if buy_price != "N/A" else "N/A",
-                    "sell_price": sell_price if sell_price != "N/A" else "N/A"
+                    "sell_price": sell_price if sell_price != "N/A" else "N/A",
+                    "latest_total_assets": latest_total_assets,
+                    "latest_total_liabilities": latest_total_liabilities,
+                    "latest_shares_outstanding": latest_shares_outstanding,
+                    "latest_current_assets": latest_current_assets,
+                    "latest_current_liabilities": latest_current_liabilities,
+                    "free_cash_flow": None  # Placeholder; calculate or fetch as needed
                 }
                 stock_data_list.append(stock_data)
 
@@ -1238,12 +1260,12 @@ class GrahamScreeningApp:
 
             # Create individual stock sheets
             for row in qualifiers:
-                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr = row
+                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_current_assets, latest_current_liabilities, raw_income_data, key_metrics_data, latest_short_term_debt, latest_book_value = row
                 price = prices.get(ticker, "N/A")
                 stock_sheet = wb.create_sheet(ticker)
 
-                # Set row heights to 15 for rows 1 to 50
-                for row_num in range(1, 51):
+                # Set row heights to 15 for rows 1 to 55
+                for row_num in range(1, 56):
                     stock_sheet.row_dimensions[row_num].height = 15
 
                 # Merge cells A2:K3 for company name and ticker
@@ -1255,7 +1277,7 @@ class GrahamScreeningApp:
                 company_ticker_cell.hyperlink = f"https://www.morningstar.com/stocks/xnys/{ticker}/quote"
 
                 # Set column widths
-                stock_sheet.column_dimensions['A'].width = 25
+                stock_sheet.column_dimensions['A'].width = 30
                 for col in range(2, 13):  # B to L
                     stock_sheet.column_dimensions[get_column_letter(col)].width = 10
                 stock_sheet.column_dimensions['M'].width = 15
@@ -1337,16 +1359,25 @@ class GrahamScreeningApp:
                 cell_m3.font = Font(bold=True)
                 cell_m3.alignment = Alignment(horizontal='center', vertical='center')
 
-                # Set bold borders
+                # Set thick outside borders for L2:O3
                 bold_side = Side(style='thick')
                 thin_side = Side(style='thin')
+                cell_l2.border = Border(top=bold_side, left=bold_side, bottom=thin_side)
+                cell_m2.border = Border(top=bold_side, bottom=thin_side, right=bold_side, left=thin_side)
+                cell_n2.border = Border(top=bold_side, bottom=thin_side, left=bold_side)
+                cell_o2.border = Border(top=bold_side, bottom=thin_side, right=bold_side, left=thin_side)
+                cell_l3.border = Border(top=thin_side, left=bold_side, bottom=bold_side, right=thin_side)
+                cell_m3.border = Border(top=thin_side, left=thin_side, bottom=bold_side)
 
-                cell_l2.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=thin_side)
-                cell_m2.border = Border(top=bold_side, right=bold_side, bottom=bold_side, left=thin_side)
-                cell_n2.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=thin_side)
-                cell_o2.border = Border(top=bold_side, right=bold_side, bottom=bold_side, left=thin_side)
-                cell_l3.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=bold_side)
-                cell_m3.border = Border(top=bold_side, left=bold_side, bottom=bold_side, right=bold_side)
+                # Set thick border for N4:O4
+                for col in ['N', 'O']:
+                    cell = stock_sheet[f'{col}4']
+                    cell.border = Border(top=bold_side)
+
+                # Set thin bottom border for P3
+                for col in ['P']:
+                    cell = stock_sheet[f'{col}3']
+                    cell.border = Border(left=bold_side)
 
                 # Define labels with Unicode subscripts
                 sub_1 = '\u2081'
@@ -1365,8 +1396,8 @@ class GrahamScreeningApp:
                 ]
 
                 # Set labels in A4:A12 and M4:M12
-                for i, label in enumerate(labels):
-                    row_num = 4 + i
+                for i, label in enumerate(labels, start=4):
+                    row_num = i
                     cell_a = stock_sheet[f'A{row_num}']
                     cell_m = stock_sheet[f'M{row_num}']
                     cell_a.value = label
@@ -1452,7 +1483,7 @@ class GrahamScreeningApp:
                     else:
                         stock_sheet.cell(row=11, column=col).value = "N/A"
 
-                # Set L4 to "Avgâ‚â‚€"
+                # Set L4 to "Avg10"
                 stock_sheet['L4'].value = f"Avg{sub_10}"
                 stock_sheet['L4'].font = Font(bold=True)
                 stock_sheet['L4'].alignment = Alignment(horizontal='center', vertical='center')
@@ -1524,11 +1555,635 @@ class GrahamScreeningApp:
                 for col in ['A', 'B', 'C', 'E', 'F', 'G']:
                     stock_sheet[f'{col}13'].alignment = Alignment(horizontal='center', vertical='center')
 
+                # Set thick bottom border for B14:C14
+                for col in ['B', 'C']:
+                    cell = stock_sheet[f'{col}14']
+                    cell.border = Border(bottom=bold_side)
+
+                # Set thick side border for D15
+                for col in ['D']:
+                    cell = stock_sheet[f'{col}15']
+                    cell.border = Border(left=bold_side)
+
+                # Set I14
+                stock_sheet['I14'].value = "Intelligent Investor Earnings Multiplier (8.5-20)"
+                stock_sheet['I14'].font = Font(bold=True)
+                stock_sheet['I14'].alignment = Alignment(horizontal='left', vertical='center')
+
+                # Calculate earnings multiplier
+                if eps_cagr is not None:
+                    g = max(eps_cagr * 100, 0)
+                    earnings_multiplier = min(8.5 + 2 * g, 20)
+                else:
+                    earnings_multiplier = "N/A"
+
+                # Set M14
+                if earnings_multiplier != "N/A":
+                    stock_sheet['M14'].value = earnings_multiplier
+                    stock_sheet['M14'].number_format = '0.00'
+                else:
+                    stock_sheet['M14'].value = "N/A"
+                stock_sheet['M14'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set thin bottom border for I14:M14
+                for col in ['I', 'J', 'K', 'L', 'M']:
+                    cell = stock_sheet[f'{col}14']
+                    cell.border = Border(bottom=thin_side)
+
+                # Merge A15:C15 and set thick outside borders
+                stock_sheet.merge_cells('A15:C15')
+                cell_a15 = stock_sheet['A15']
+                cell_a15.value = "Value to a Private Owner Test (POT) (Page 98)"
+                cell_a15.font = Font(bold=True)
+                cell_a15.alignment = Alignment(horizontal='center', vertical='center')
+                cell_a15.border = Border(left=bold_side, top=bold_side, right=bold_side, bottom=bold_side)
+
+                # Set I15
+                stock_sheet['I15'].value = "Intrinsic Value"
+                stock_sheet['I15'].font = Font(bold=True)
+                stock_sheet['I15'].alignment = Alignment(horizontal='left', vertical='center')
+
+                # Set M15
+                if earnings_multiplier != "N/A":
+                    stock_sheet['M15'].value = "=L7*M14"
+                    stock_sheet['M15'].number_format = '$#,##0.00'
+                else:
+                    stock_sheet['M15'].value = "N/A"
+                stock_sheet['M15'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set double thin bottom border for I15:M15
+                double_side = Side(style='double')
+                for col in ['I', 'J', 'K', 'L', 'M']:
+                    cell = stock_sheet[f'{col}15']
+                    cell.border = Border(bottom=double_side)
+
+                # Set A16:A27 labels, left-aligned and vertically centered
+                a_labels = [
+                    "Total Assets ($M)",
+                    "Total Liabilities ($M)",
+                    "Free Cash Flow ($M)",
+                    "Shares Outstanding (M)",
+                    "Value Per Share of Cash and Assets:",
+                    "Price in Relation to POT (>150%)",
+                    "Is the Company Worth Owning?",
+                    "",  # Skipped for spacing
+                    "Working Capital ($M)",
+                    "Value Per Share of Working Capital:",
+                    "Price in Relation to Working Capital (>150%):",
+                    "Does Capital Alone Make It A Bargain?"
+                ]
+                for i, label in enumerate(a_labels, start=16):
+                    cell = stock_sheet[f'A{i}']
+                    cell.value = label
+                    cell.alignment = Alignment(horizontal='left', vertical='center')
+
+                # Populate C16:C19 and C24 with data, centered horizontally and vertically
+                if latest_total_assets is not None:
+                    stock_sheet['C16'].value = latest_total_assets / 1_000_000
+                    stock_sheet['C16'].number_format = '$#,##0'
+                else:
+                    stock_sheet['C16'].value = "N/A"
+                stock_sheet['C16'].alignment = Alignment(horizontal='center', vertical='center')
+
+                if latest_total_liabilities is not None:
+                    stock_sheet['C17'].value = latest_total_liabilities / 1_000_000
+                    stock_sheet['C17'].number_format = '$#,##0'
+                else:
+                    stock_sheet['C17'].value = "N/A"
+                stock_sheet['C17'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Assuming free_cash_flow is calculated or fetched; placeholder for now
+                free_cash_flow = 0  # Replace with actual calculation or data
+                stock_sheet['C18'].value = free_cash_flow
+                stock_sheet['C18'].number_format = '$#,##0'
+                stock_sheet['C18'].alignment = Alignment(horizontal='center', vertical='center')
+
+                if latest_shares_outstanding is not None:
+                    stock_sheet['C19'].value = latest_shares_outstanding / 1_000_000
+                    stock_sheet['C19'].number_format = '0'
+                else:
+                    stock_sheet['C19'].value = "N/A"
+                stock_sheet['C19'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Calculate Working Capital: latest_current_assets - latest_current_liabilities
+                if latest_current_assets is not None and latest_current_liabilities is not None:
+                    working_capital = latest_current_assets - latest_current_liabilities
+                    stock_sheet['C24'].value = working_capital / 1_000_000
+                    stock_sheet['C24'].number_format = '$#,##0'
+                else:
+                    stock_sheet['C24'].value = "N/A"
+                stock_sheet['C24'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set formulas for C20, C21, C25, C26
+                stock_sheet['C20'].value = "=(C16 - C17 + C18) / C19"
+                stock_sheet['C20'].number_format = '$#,##0.00'
+                stock_sheet['C20'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['C21'].value = "=C20 / L2"
+                stock_sheet['C21'].number_format = '0.0%'
+                stock_sheet['C21'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['C25'].value = "=C24 / C19"
+                stock_sheet['C25'].number_format = '$#,##0.00'
+                stock_sheet['C25'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['C26'].value = "=C25 / L2"
+                stock_sheet['C26'].number_format = '0.0%'
+                stock_sheet['C26'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set conditional formulas and shading for C22 and C27
+                stock_sheet['C22'].value = '=IF(C21>=1.5, "Yes", IF(C21>=1, "Maybe", "No"))'
+                stock_sheet['C22'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['C27'].value = '=IF(C26>=1.5, "Yes", IF(C26>=1, "Maybe", "No"))'
+                stock_sheet['C27'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Apply conditional formatting for C22 and C27
+                green_fill = PatternFill(start_color='00FF00', end_color='00FF00', fill_type='solid')
+                light_blue_fill = PatternFill(start_color='ADD8E6', end_color='ADD8E6', fill_type='solid')
+                red_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
+
+                stock_sheet.conditional_formatting.add('C22', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"Yes"'], fill=green_fill))
+                stock_sheet.conditional_formatting.add('C22', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"Maybe"'], fill=light_blue_fill))
+                stock_sheet.conditional_formatting.add('C22', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"No"'], fill=red_fill))
+
+                stock_sheet.conditional_formatting.add('C27', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"Yes"'], fill=green_fill))
+                stock_sheet.conditional_formatting.add('C27', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"Maybe"'], fill=light_blue_fill))
+                stock_sheet.conditional_formatting.add('C27', openpyxl.formatting.rule.CellIsRule(operator='equal', formula=['"No"'], fill=red_fill))
+
+                # Skip C23 for spacing
+                stock_sheet['C23'].value = ""
+                stock_sheet['C23'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set thick outside borders for A16:C27
+                for row in range(16, 28):
+                    for col in ['A', 'B', 'C']:
+                        cell = stock_sheet[f'{col}{row}']
+                        cell.border = Border(
+                            top=bold_side if row == 16 else thin_side,
+                            bottom=bold_side if row == 27 else thin_side,
+                            left=bold_side if col == 'A' else thin_side,
+                            right=bold_side if col == 'C' else thin_side
+                        )
+
+                # Set G17, G18, H19, G21, G22, H23, G25, G26, G27
+                stock_sheet['G17'].value = "Asset Value Factor Reduction (Page 155)"
+                stock_sheet['G17'].font = Font(bold=True)
+                stock_sheet['G17'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G18'].value = "Does Earning Power Value exceed Value of Cash and Assets by 2?"
+                stock_sheet['G18'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['H19'].value = "If Yes... apply Asset Value Reduction to Intrinsic Value."
+                stock_sheet['H19'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G21'].value = "Excess Current Asset Factor (Page 156)"
+                stock_sheet['G21'].font = Font(bold=True)
+                stock_sheet['G21'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G22'].value = "Does Value of Cash and Assets exceed Intrinsic Value?"
+                stock_sheet['G22'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['H23'].value = "If Yes... apply Current Asset Premium to Intrinsic Value."
+                stock_sheet['H23'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G25'].value = "Price in Relation to Adjusted Intrinsic Value (>150%)"
+                stock_sheet['G25'].font = Font(bold=True)
+                stock_sheet['G25'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G26'].value = "Is the stock a bargain?"
+                stock_sheet['G26'].font = Font(bold=True)
+                stock_sheet['G26'].alignment = Alignment(horizontal='left', vertical='center')
+
+                stock_sheet['G27'].value = "When should I consider the price to be a bargain?"
+                stock_sheet['G27'].font = Font(bold=True)
+                stock_sheet['G27'].alignment = Alignment(horizontal='left', vertical='center')
+
+                # Set thin bottom border for G25:L25, G26:L26, G27:L27
+                for row in [25, 26, 27]:
+                    for col in ['G', 'H', 'I', 'J', 'K', 'L']:
+                        cell = stock_sheet[f'{col}{row}']
+                        cell.border = Border(bottom=thin_side)
+
+                # Set M18, M19, M22, M23, M25, M26
+                stock_sheet['M18'].value = '=IF(M15/C20>=2, "Yes", "No")'
+                stock_sheet['M18'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['M19'].value = '=IF(M18="Yes", M15 - (M15 - 2*C20)/4, M15)'
+                stock_sheet['M19'].number_format = '$#,##0.00'
+                stock_sheet['M19'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['M22'].value = '=IF(C20 - M15 > 0, "Yes", "No")'
+                stock_sheet['M22'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['M23'].value = '=IF(M22="Yes", M15 + (C20 - M15)/2, M15)'
+                stock_sheet['M23'].number_format = '$#,##0.00'
+                stock_sheet['M23'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['M25'].value = '=IF(M18="Yes", M19/L2, IF(M22="Yes", M23/L2, M15/L2))'
+                stock_sheet['M25'].number_format = '0.0%'
+                stock_sheet['M25'].alignment = Alignment(horizontal='center', vertical='center')
+
+                stock_sheet['M26'].value = '=IF(M25>=1.5, "Yes", IF(M25<1, "No", "Maybe"))'
+                stock_sheet['M26'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # M27 not specified, assuming placeholder or same as M23
+                stock_sheet['M27'].value = "=M23"  # Placeholder assumption
+                stock_sheet['M27'].number_format = '$#,##0.00'
+                stock_sheet['M27'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set A29: "Shares Outstanding"
+                stock_sheet['A29'].value = "Shares Outstanding"
+                stock_sheet['A29'].alignment = Alignment(horizontal='left', vertical='center')
+
+                # Populate B29:K29 with shares outstanding from raw_income_data
+                if raw_income_data:
+                    income_data_list = json.loads(raw_income_data)
+                    shares_outstanding_dict = {}
+                    for entry in income_data_list:
+                        if 'date' in entry and 'weightedAverageShsOut' in entry:
+                            year = entry['date'][:4]
+                            shares_outstanding_dict[year] = float(entry['weightedAverageShsOut'])
+                    shares_outstanding_list = [shares_outstanding_dict.get(str(year), None) for year in years_list]
+                    for col, shares in enumerate(shares_outstanding_list, start=2):  # B to K
+                        cell = stock_sheet.cell(row=29, column=col)
+                        if shares is not None:
+                            cell.value = shares / 1_000_000  # Convert to millions
+                            cell.number_format = '0'
+                        else:
+                            cell.value = "N/A"
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                    # Calculate CAGR for L29 to check if shares are trending downward
+                    valid_shares = [s for s in shares_outstanding_list if s is not None and s > 0]
+                    if len(valid_shares) >= 2:
+                        beginning_value = valid_shares[0]
+                        ending_value = valid_shares[-1]
+                        n = len(valid_shares) - 1  # Number of periods
+                        if beginning_value > 0 and ending_value > 0:
+                            cagr = (ending_value / beginning_value) ** (1 / n) - 1
+                            stock_sheet['L29'].value = "Yes" if cagr < 0 else "No"
+                        else:
+                            stock_sheet['L29'].value = "N/A"
+                    else:
+                        stock_sheet['L29'].value = "N/A"
+                    stock_sheet['L29'].alignment = Alignment(horizontal='center', vertical='center')
+                else:
+                    for col in range(2, 13):  # B to L
+                        stock_sheet.cell(row=29, column=col).value = "N/A"
+                        stock_sheet.cell(row=29, column=col).alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set A31: "SHARES IF $1000"
+                stock_sheet['A31'].value = "SHARES IF $1000"
+                stock_sheet['A31'].font = Font(bold=True)
+                stock_sheet['A31'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set B31: =1000/L2, formatted for numbers with 0 decimals, centered
+                stock_sheet['B31'].value = "=1000/L2"
+                stock_sheet['B31'].number_format = '0'
+                stock_sheet['B31'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set A32: "EARNINGS $1000"
+                stock_sheet['A32'].value = "EARNINGS $1000"
+                stock_sheet['A32'].font = Font(bold=True)
+                stock_sheet['A32'].alignment = Alignment(horizontal='center', vertical='center')
+
+                # Set B32 to K32: =$B$31 * B9 for B32, =$B$31 * C9 for C32, etc., formatted as currency, centered
+                for col in range(2, 12):  # B to K
+                    col_letter = get_column_letter(col)
+                    formula = f"=$B$31 * {col_letter}9"
+                    cell = stock_sheet.cell(row=32, column=col)
+                    cell.value = formula
+                    cell.number_format = '$#,##0.00'
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Ensure A30 is bold and centered (assuming it's a placeholder or empty)
+                stock_sheet['A30'].font = Font(bold=True)
+                stock_sheet['A30'].alignment = Alignment(horizontal='center', vertical='center')
+
                 # Center B4:L12 horizontally and vertically
                 for row in range(4, 13):
                     for col in range(2, 13):  # B to L
                         cell = stock_sheet.cell(row=row, column=col)
                         cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Parse additional data for new sections
+                income_data_list = json.loads(raw_income_data) if raw_income_data else []
+                net_income_dict = {entry['date'][:4]: float(entry['netIncome']) for entry in income_data_list if 'date' in entry and 'netIncome' in entry}
+                net_income_list = [net_income_dict.get(str(year), None) for year in years_list[-10:]] if years_list else []
+
+                balance_data_list = json.loads(balance_data) if balance_data else []
+                book_value_dict = {entry['date'][:4]: float(entry['totalStockholdersEquity']) for entry in balance_data_list if 'date' in entry and 'totalStockholdersEquity' in entry}
+                book_value_list = [book_value_dict.get(str(year), None) for year in years_list[-10:]] if years_list else []
+
+                key_metrics_list = json.loads(key_metrics_data) if key_metrics_data else []
+                pe_ratio_list = [float(entry['peRatio']) for entry in key_metrics_list if 'peRatio' in entry and entry['peRatio'] is not None]
+                average_pe = sum(pe_ratio_list) / len(pe_ratio_list) if pe_ratio_list else "N/A"
+
+                # Net Incomes section (A34:K35)
+                stock_sheet.merge_cells('A34:A35')
+                cell = stock_sheet['A34']
+                cell.value = "Net Incomes ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                for col, net_income in enumerate(net_income_list, start=2):  # B34:K34
+                    cell = stock_sheet.cell(row=34, column=col)
+                    if net_income is not None:
+                        cell.value = net_income / 1_000_000
+                        cell.number_format = '$#,##0'
+                    else:
+                        cell.value = "N/A"
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                for col in range(3, 12):  # C35:K35
+                    prev_net_income = stock_sheet.cell(row=34, column=col-1).value
+                    current_net_income = stock_sheet.cell(row=34, column=col).value
+                    if isinstance(prev_net_income, (int, float)) and isinstance(current_net_income, (int, float)) and prev_net_income != 0:
+                        change = (current_net_income - prev_net_income) / prev_net_income
+                        stock_sheet.cell(row=35, column=col).value = change
+                        stock_sheet.cell(row=35, column=col).number_format = '0.00%'
+                    else:
+                        stock_sheet.cell(row=35, column=col).value = "N/A"
+                    stock_sheet.cell(row=35, column=col).alignment = Alignment(horizontal='center', vertical='center')
+
+                # Book Value section (A36:K37)
+                stock_sheet.merge_cells('A36:A37')
+                cell = stock_sheet['A36']
+                cell.value = "Book Value ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                for col, book_value in enumerate(book_value_list, start=2):  # B36:K36
+                    cell = stock_sheet.cell(row=36, column=col)
+                    if book_value is not None:
+                        cell.value = book_value / 1_000_000
+                        cell.number_format = '$#,##0.00'
+                    else:
+                        cell.value = "N/A"
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                for col in range(3, 12):  # C37:K37
+                    prev_book_value = stock_sheet.cell(row=36, column=col-1).value
+                    current_book_value = stock_sheet.cell(row=36, column=col).value
+                    if isinstance(prev_book_value, (int, float)) and isinstance(current_book_value, (int, float)) and prev_book_value != 0:
+                        change = (current_book_value - prev_book_value) / prev_book_value
+                        stock_sheet.cell(row=37, column=col).value = change
+                        stock_sheet.cell(row=37, column=col).number_format = '0.00%'
+                    else:
+                        stock_sheet.cell(row=37, column=col).value = "N/A"
+                    stock_sheet.cell(row=37, column=col).alignment = Alignment(horizontal='center', vertical='center')
+
+                # 10 Yr P/E Avg section (A38:B39)
+                stock_sheet.merge_cells('A38:A39')
+                cell = stock_sheet['A38']
+                cell.value = "10 Yr P/E Avg"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('B38:B39')
+                cell = stock_sheet['B38']
+                if average_pe != "N/A":
+                    cell.value = average_pe
+                    cell.number_format = '0.00'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Current Assets section (D38:E39)
+                stock_sheet.merge_cells('D38:D39')
+                cell = stock_sheet['D38']
+                cell.value = "Current Assets ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('E38:E39')
+                cell = stock_sheet['E38']
+                if latest_current_assets is not None:
+                    cell.value = latest_current_assets / 1_000_000
+                    cell.number_format = '$#,##0'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Short Term Debt section (A40:B41)
+                stock_sheet.merge_cells('A40:A41')
+                cell = stock_sheet['A40']
+                cell.value = "Short Term Debt ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('B40:B41')
+                cell = stock_sheet['B40']
+                if latest_short_term_debt is not None:
+                    cell.value = latest_short_term_debt / 1_000_000
+                    cell.number_format = '$#,##0'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Current Liabilities section (D40:E41)
+                stock_sheet.merge_cells('D40:D41')
+                cell = stock_sheet['D40']
+                cell.value = "Current Liabilities ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('E40:E41')
+                cell = stock_sheet['E40']
+                if latest_current_liabilities is not None:
+                    cell.value = latest_current_liabilities / 1_000_000
+                    cell.number_format = '$#,##0'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Long Term Debt section (A42:B43)
+                stock_sheet.merge_cells('A42:A43')
+                cell = stock_sheet['A42']
+                cell.value = "Long Term Debt ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('B42:B43')
+                cell = stock_sheet['B42']
+                if latest_long_term_debt is not None:
+                    cell.value = latest_long_term_debt / 1_000_000
+                    cell.number_format = '$#,##0'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Book Value (total) section (D42:E43)
+                stock_sheet.merge_cells('D42:D43')
+                cell = stock_sheet['D42']
+                cell.value = "Book Value ($M)"
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                stock_sheet.merge_cells('E42:E43')
+                cell = stock_sheet['E42']
+                if latest_book_value is not None:
+                    cell.value = latest_book_value / 1_000_000
+                    cell.number_format = '$#,##0'
+                else:
+                    cell.value = "N/A"
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+
+                # Benjamin Graham's 10 Rule Stability Test section (A45:A55)
+                stability_test_questions = [
+                    "Benjamin Graham's 10 Rule Stability Test",
+                    "Is the Earnings/Price Ratio >= 2x AAA Bond Yield?",
+                    "Is the P/E Ratio <= .4 of highest average P/E of the last 10 years?",
+                    "Is the Dividend Yield >= 2/3 AAA Bond Yield?",
+                    "Is the Share Price <= 2/3 Book Value Per Share?",
+                    "Is the Share Price <= 2/3 Net Current Asset Value (NCAV)?",
+                    "Is Total Debt < Book Value?",
+                    "Is the Current Ratio >= 2?",
+                    "Is Total Debt <= 2*(Current Assets - Current Liabilities - Long Term Debt)?  (NCAV)",
+                    "Has Net Income Doubled in the Past 10 years?",
+                    "Have Net Incomes declined no more than 5% in the last 10 years?"
+                ]
+
+                for row, text in enumerate(stability_test_questions, start=45):
+                    cell = stock_sheet[f'A{row}']
+                    cell.value = text
+                    cell.alignment = Alignment(horizontal='left', vertical='center')
+                    if row == 45:
+                        cell.font = Font(bold=True)
+
+                # Add charts if there is data
+                if years_list:
+                    min_year = min(years_list)
+                    max_year = max(years_list)
+
+                    # Add horizontal line data for the first chart (at 12%)
+                    stock_sheet['Q2'] = min_year
+                    stock_sheet['Q3'] = max_year
+                    stock_sheet['R2'] = 0.12
+                    stock_sheet['R3'] = 0.12
+
+                    # First Chart: ROE and ROTC
+                    chart = ScatterChart()
+                    chart.style = 2
+
+                    # ROE series (no data labels)
+                    roe_values = Reference(stock_sheet, min_col=2, min_row=5, max_col=11, max_row=5)
+                    years_ref = Reference(stock_sheet, min_col=2, min_row=4, max_col=11, max_row=4)
+                    roe_series = Series(roe_values, years_ref, title="ROE10")
+                    roe_series.marker = Marker('circle')
+                    roe_series.graphicalProperties.line.solidFill = "0000FF"  # Blue
+                    chart.series.append(roe_series)
+
+                    # ROTC series (no data labels)
+                    rotc_values = Reference(stock_sheet, min_col=2, min_row=6, max_col=11, max_row=6)
+                    rotc_series = Series(rotc_values, years_ref, title="ROTC10")
+                    rotc_series.marker = Marker('circle')
+                    rotc_series.graphicalProperties.line.solidFill = "FF0000"  # Red
+                    chart.series.append(rotc_series)
+
+                    # Horizontal line at 12% (no data labels)
+                    hline_x = Reference(stock_sheet, min_col=17, min_row=2, max_col=17, max_row=3)  # Q2:Q3
+                    hline_y = Reference(stock_sheet, min_col=18, min_row=2, max_col=18, max_row=3)  # R2:R3
+                    hline_series = Series(hline_y, hline_x, title="12%")
+                    hline_series.marker = Marker('none')
+                    hline_series.graphicalProperties.line.dashStyle = "dash"
+                    hline_series.graphicalProperties.line.solidFill = "000000"  # Black
+                    chart.series.append(hline_series)
+
+                    # X-Axis: Years as scale values
+                    chart.x_axis.title = "Years"
+                    chart.x_axis.number_format = '0'  # Whole numbers for years
+                    chart.x_axis.scaling.min = min_year
+                    chart.x_axis.scaling.max = max_year
+                    chart.x_axis.majorUnit = 1  # One label per year
+                    chart.x_axis.tickLblPos = "low"  # Labels at the bottom
+                    chart.x_axis.majorGridlines = ChartLines()  # Enable gridlines
+
+                    # Y-Axis: Percentages as scale values
+                    chart.y_axis.title = "Percentage"
+                    chart.y_axis.number_format = '0%'  # Format as percentage
+                    # Calculate appropriate min, max, and majorUnit based on data
+                    roe_values_list = [val for val in roe_list if val is not None]
+                    rotc_values_list = [val for val in rotc_list if val is not None]
+                    all_values = roe_values_list + rotc_values_list + [12]  # Include the 12% line
+                    if all_values:
+                        min_val = min(all_values) / 100  # Convert percentage to decimal
+                        max_val = max(all_values) / 100
+                        # Adjust min and max to give some padding
+                        min_val = min(min_val, 0)  # Ensure we show at least down to 0%
+                        max_val = max_val + 0.05  # Add 5% padding on top
+                        # Set a reasonable major unit (e.g., 5% intervals)
+                        chart.y_axis.scaling.min = min_val
+                        chart.y_axis.scaling.max = max_val
+                        range_val = max_val - min_val
+                        if range_val > 0:
+                            # Aim for around 5-10 tick marks
+                            major_unit = max(0.05, round(range_val / 5, 2))  # At least 5% intervals
+                            chart.y_axis.majorUnit = major_unit
+                    chart.y_axis.majorGridlines = ChartLines()  # Enable gridlines
+                    chart.y_axis.tickLblPos = "nextTo"  # Ensure labels are visible
+
+                    # Add chart to sheet
+                    stock_sheet.add_chart(chart, "O5")
+                    chart.width = 15  # Width in cm
+                    chart.height = 8  # Height in cm
+
+                    # Second Chart: EPS and DIV
+                    chart2 = ScatterChart()
+                    chart2.style = 2
+
+                    # EPS series (no data labels)
+                    eps_values = Reference(stock_sheet, min_col=2, min_row=7, max_col=11, max_row=7)
+                    eps_series = Series(eps_values, years_ref, title="EPS10")
+                    eps_series.marker = Marker('circle')
+                    eps_series.graphicalProperties.line.solidFill = "0000FF"  # Blue
+                    chart2.series.append(eps_series)
+
+                    # DIV series (no data labels)
+                    div_values = Reference(stock_sheet, min_col=2, min_row=10, max_col=11, max_row=10)
+                    div_series = Series(div_values, years_ref, title="DIV10")
+                    div_series.marker = Marker('circle')
+                    div_series.graphicalProperties.line.solidFill = "FF0000"  # Red
+                    chart2.series.append(div_series)
+
+                    # X-Axis: Years as scale values
+                    chart2.x_axis.title = "Years"
+                    chart2.x_axis.number_format = '0'  # Whole numbers for years
+                    chart2.x_axis.scaling.min = min_year
+                    chart2.x_axis.scaling.max = max_year
+                    chart2.x_axis.majorUnit = 1  # One label per year
+                    chart2.x_axis.tickLblPos = "low"  # Labels at the bottom
+                    chart2.x_axis.majorGridlines = ChartLines()  # Enable gridlines
+
+                    # Y-Axis: Currency as scale values
+                    chart2.y_axis.title = "EPS and Dividends"
+                    chart2.y_axis.number_format = '$#,##0.00'  # Format as currency
+                    # Calculate appropriate min, max, and majorUnit based on data
+                    eps_values_list = [val for val in eps_list if val is not None]
+                    div_values_list = [val for val in div_list if val is not None]
+                    all_values = eps_values_list + div_values_list
+                    if all_values:
+                        min_val = min(all_values)
+                        max_val = max(all_values)
+                        # Adjust min and max to give some padding
+                        min_val = min(min_val, 0)  # Ensure we show at least down to 0
+                        max_val = max_val + (max_val - min_val) * 0.1  # Add 10% padding on top
+                        # Set a reasonable major unit (e.g., $1 intervals or based on range)
+                        chart2.y_axis.scaling.min = min_val
+                        chart2.y_axis.scaling.max = max_val
+                        range_val = max_val - min_val
+                        if range_val > 0:
+                            # Aim for around 5-10 tick marks
+                            major_unit = max(1.0, round(range_val / 5, 1))  # At least $1 intervals
+                            chart2.y_axis.majorUnit = major_unit
+                    chart2.y_axis.majorGridlines = ChartLines()  # Enable gridlines
+                    chart2.y_axis.tickLblPos = "nextTo"  # Ensure labels are visible
+
+                    # Add chart to sheet
+                    stock_sheet.add_chart(chart2, "O21")
+                    chart2.width = 15  # Width in cm
+                    chart2.height = 8  # Height in cm
 
             # Save the workbook
             file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], initialfile=f"{exchange}_Qualifying_Stocks.xlsx")
@@ -1540,7 +2195,7 @@ class GrahamScreeningApp:
             messagebox.showerror("Export Error", f"An error occurred while exporting: {str(e)}")
         finally:
             conn.close()
-
+                
     def export_nyse_qualifying_stocks(self):
         self.export_qualifying_stocks("NYSE")
 

@@ -17,7 +17,7 @@ import random
 from ftplib import FTP
 from config import (
     FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, 
-    NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR, FAVORITES_LOCK, 
+    NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR, FRED_API_KEY, FAVORITES_LOCK, 
     FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID, 
     screening_logger, analyze_logger
 )
@@ -91,84 +91,124 @@ def get_aaa_yield(api_key, default_yield=0.045):
             analyze_logger.info(f"Using default AAA yield: {default_yield}")
             return default_yield
 
+# Global flag to track schema initialization
+schema_initialized = False
+schema_lock = threading.Lock()
+
 def get_stocks_connection():
     """Establish a connection to the SQLite database with increased timeout."""
+    global schema_initialized
     try:
         conn = sqlite3.connect(CACHE_DB, timeout=60)
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS stocks (
-            ticker TEXT PRIMARY KEY,
-            date TEXT,
-            roe TEXT,
-            rotc TEXT,
-            eps TEXT,
-            dividend TEXT,
-            ticker_list_hash TEXT,
-            balance_data TEXT,
-            cash_flow_data TEXT,
-            key_metrics_data TEXT,
-            timestamp REAL,
-            company_name TEXT,
-            debt_to_equity REAL,
-            eps_ttm REAL,
-            book_value_per_share REAL,
-            common_score INTEGER,
-            latest_revenue REAL,
-            available_data_years INTEGER,
-            sector TEXT,
-            years TEXT,
-            latest_total_assets REAL,
-            latest_total_liabilities REAL,
-            latest_shares_outstanding REAL,
-            latest_long_term_debt REAL,
-            latest_short_term_debt REAL,
-            latest_current_assets REAL,
-            latest_current_liabilities REAL,
-            latest_book_value REAL,
-            historic_pe_ratios TEXT,
-            latest_net_income REAL,
-            eps_cagr REAL
-        )''')
-        cursor.execute("PRAGMA table_info(stocks)")
-        columns = [col[1] for col in cursor.fetchall()]
-        new_columns = [
-            'latest_total_assets REAL',
-            'latest_total_liabilities REAL',
-            'latest_shares_outstanding REAL',
-            'latest_long_term_debt REAL',
-            'latest_short_term_debt REAL',
-            'latest_current_assets REAL',
-            'latest_current_liabilities REAL',
-            'latest_book_value REAL',
-            'historic_pe_ratios TEXT',
-            'latest_net_income REAL',
-            'eps_cagr REAL'
-        ]
-        for col in new_columns:
-            col_name = col.split()[0]
-            if col_name not in columns:
-                cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
-                analyze_logger.info(f"Added '{col_name}' column to stocks table")
-        cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
-            ticker TEXT PRIMARY KEY,
-            common_score INTEGER,
-            date TEXT,
-            sector TEXT,
-            exchange TEXT
-        )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS screening_progress (
-            exchange TEXT,
-            ticker TEXT,
-            timestamp TEXT,
-            file_hash TEXT,
-            status TEXT,
-            PRIMARY KEY (exchange, ticker)
-        )''')
-        conn.commit()
+        
+        # Check if schema needs to be initialized
+        with schema_lock:
+            if not schema_initialized:
+                # Create or update the 'stocks' table with new raw data columns
+                cursor.execute('''CREATE TABLE IF NOT EXISTS stocks (
+                    ticker TEXT PRIMARY KEY,
+                    date TEXT,
+                    roe TEXT,
+                    rotc TEXT,
+                    eps TEXT,
+                    dividend TEXT,
+                    ticker_list_hash TEXT,
+                    balance_data TEXT,
+                    cash_flow_data TEXT,
+                    key_metrics_data TEXT,
+                    timestamp REAL,
+                    company_name TEXT,
+                    debt_to_equity REAL,
+                    eps_ttm REAL,
+                    book_value_per_share REAL,
+                    common_score INTEGER,
+                    latest_revenue REAL,
+                    available_data_years INTEGER,
+                    sector TEXT,
+                    years TEXT,
+                    latest_total_assets REAL,
+                    latest_total_liabilities REAL,
+                    latest_shares_outstanding REAL,
+                    latest_long_term_debt REAL,
+                    latest_short_term_debt REAL,
+                    latest_current_assets REAL,
+                    latest_current_liabilities REAL,
+                    latest_book_value REAL,
+                    historic_pe_ratios TEXT,
+                    latest_net_income REAL,
+                    eps_cagr REAL,
+                    latest_free_cash_flow REAL,
+                    raw_income_data TEXT,
+                    raw_balance_data TEXT,
+                    raw_dividend_data TEXT,
+                    raw_profile_data TEXT,
+                    raw_cash_flow_data TEXT,
+                    raw_key_metrics_data TEXT
+                )''')
+                cursor.execute("PRAGMA table_info(stocks)")
+                columns = [col[1] for col in cursor.fetchall()]
+                new_columns = [
+                    'latest_total_assets REAL',
+                    'latest_total_liabilities REAL',
+                    'latest_shares_outstanding REAL',
+                    'latest_long_term_debt REAL',
+                    'latest_short_term_debt REAL',
+                    'latest_current_assets REAL',
+                    'latest_current_liabilities REAL',
+                    'latest_book_value REAL',
+                    'historic_pe_ratios TEXT',
+                    'latest_net_income REAL',
+                    'eps_cagr REAL',
+                    'latest_free_cash_flow REAL',
+                    'raw_income_data TEXT',
+                    'raw_balance_data TEXT',
+                    'raw_dividend_data TEXT',
+                    'raw_profile_data TEXT',
+                    'raw_cash_flow_data TEXT',
+                    'raw_key_metrics_data TEXT'
+                ]
+                for col in new_columns:
+                    col_name = col.split()[0]
+                    if col_name not in columns:
+                        cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
+                        analyze_logger.info(f"Added '{col_name}' column to stocks table")
+                
+                # Create or update the 'graham_qualifiers' table
+                cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
+                    ticker TEXT PRIMARY KEY,
+                    common_score INTEGER,
+                    date TEXT,
+                    sector TEXT,
+                    exchange TEXT,
+                    min_criteria INTEGER
+                )''')
+                cursor.execute("PRAGMA table_info(graham_qualifiers)")
+                columns = [col[1] for col in cursor.fetchall()]
+                if 'min_criteria' not in columns:
+                    cursor.execute("ALTER TABLE graham_qualifiers ADD COLUMN min_criteria INTEGER")
+                    analyze_logger.info("Added 'min_criteria' column to graham_qualifiers table")
+                else:
+                    analyze_logger.debug("'min_criteria' column already exists in graham_qualifiers table")
+                
+                # Create the 'screening_progress' table if it doesn't exist
+                cursor.execute('''CREATE TABLE IF NOT EXISTS screening_progress (
+                    exchange TEXT,
+                    ticker TEXT,
+                    timestamp TEXT,
+                    file_hash TEXT,
+                    status TEXT,
+                    PRIMARY KEY (exchange, ticker)
+                )''')
+                
+                conn.commit()
+                schema_initialized = True
+                analyze_logger.info("Database schema initialized successfully.")
+        
+        return conn, cursor
     except sqlite3.Error as e:
         analyze_logger.error(f"Failed to initialize database connection: {str(e)}")
         raise
-    return conn, cursor
 
 def get_sector_growth_rate(sector: str) -> float:
     """Fetch the growth rate for a given sector from the hardcoded dictionary."""
@@ -227,7 +267,6 @@ class TickerManager:
             callback()
 
     async def download_ticker_files(self):
-        """Download the latest ticker files from FTP and update the hash in the database."""
         try:
             ftp = FTP('ftp.nasdaqtrader.com')
             ftp.login()
@@ -254,6 +293,16 @@ class TickerManager:
                     conn.close()
             ftp.quit()
             analyze_logger.info("Successfully downloaded and updated ticker files from FTP.")
+            
+            # Clear invalid ticker files
+            for invalid_file in [
+                os.path.join(self.user_data_dir, "NYSE Invalid Tickers.txt"),
+                os.path.join(self.user_data_dir, "NASDAQ Invalid Tickers.txt")
+            ]:
+                with open(invalid_file, 'w') as f:
+                    f.write("")  # Overwrite with empty content
+                analyze_logger.info(f"Cleared invalid tickers file: {invalid_file}")
+            
         except Exception as e:
             analyze_logger.error(f"Failed to download ticker files: {str(e)}")
             raise
@@ -476,18 +525,19 @@ async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, c
     analyze_logger.info(f"Successfully fetched FMP data for {ticker}")
     return income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data
 
-async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit=None, cancel_event=None, income_data=None, balance_data=None, dividend_data=None) -> Tuple[List[float], List[float], List[float], List[float], List[int], Dict[str, float], List[Dict]]:
-    """Process FMP data into historical financial metrics for Graham analysis using FMxP dividends."""
+async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit=None, cancel_event=None, income_data=None, balance_data=None, dividend_data=None, cash_flow_data=None) -> Tuple[List[float], List[float], List[float], List[float], List[int], Dict[str, float], List[Dict], float]:
+    """Process FMP data into historical financial metrics for Graham analysis and calculate Free Cash Flow (FCF)."""
     roe_list = []
     rotc_list = []
     eps_list = []
     div_list = []
     revenue = {}
     balance_data_list = []
+    free_cash_flow = 0.0  # Initialize FCF
 
-    if not income_data or not balance_data or not dividend_data:
-        analyze_logger.error(f"No income, balance, or dividend data provided for {ticker}")
-        return [], [], [], [], [], {}, []
+    if not income_data or not balance_data or not dividend_data or not cash_flow_data:
+        analyze_logger.error(f"No income, balance, dividend, or cash flow data provided for {ticker}")
+        return [], [], [], [], [], {}, [], 0.0
 
     years_income = [int(entry['date'].split('-')[0]) for entry in income_data if 'date' in entry]
     years_balance = [int(entry['date'].split('-')[0]) for entry in balance_data if 'date' in entry]
@@ -495,7 +545,7 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
 
     if not years_available:
         analyze_logger.error(f"No common years found for {ticker} between income and balance data")
-        return [], [], [], [], [], {}, []
+        return [], [], [], [], [], {}, [], 0.0
 
     # Fetch dividend data correctly from 'historical' key
     dividend_history = dividend_data.get('historical', [])
@@ -514,6 +564,14 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     analyze_logger.debug(f"{ticker}: Dividend dictionary after processing: {div_dict}")
     if not any(div_dict.values()):
         analyze_logger.warning(f"No dividend data found for {ticker} in the available years")
+
+    # Calculate FCF for the latest year
+    if cash_flow_data and cash_flow_data[0]:  # Latest year's cash flow data
+        latest_cash_flow = cash_flow_data[0]
+        operating_cash_flow = float(latest_cash_flow.get('netCashProvidedByOperatingActivities', 0))
+        capex = float(latest_cash_flow.get('capitalExpenditure', 0))  # Typically negative
+        free_cash_flow = operating_cash_flow + capex  # Add since capex is negative
+        analyze_logger.debug(f"{ticker}: Calculated FCF = {operating_cash_flow} + {capex} = {free_cash_flow}")
 
     # Process data for each year in ascending order
     for year in years_available:
@@ -544,10 +602,10 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
 
         balance_data_list.append(balance_entry)
 
-    analyze_logger.debug(f"Fetched data for {ticker}: ROE={len(roe_list)}, ROTC={len(rotc_list)}, EPS={len(eps_list)}, Div={len(div_list)}, Years={years_available}")
+    analyze_logger.debug(f"Fetched data for {ticker}: ROE={len(roe_list)}, ROTC={len(rotc_list)}, EPS={len(eps_list)}, Div={len(div_list)}, FCF={free_cash_flow}")
     analyze_logger.debug(f"{ticker}: EPS List: {eps_list}")
     analyze_logger.debug(f"{ticker}: Dividend List: {div_list}")
-    return roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list
+    return roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list, free_cash_flow
 
 def calculate_cagr(start_value, end_value, years):
     if start_value <= 0 or end_value <= 0 or years <= 0:
@@ -691,9 +749,11 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                     latest_total_assets, latest_total_liabilities, latest_shares_outstanding,
                     latest_long_term_debt, latest_short_term_debt, latest_current_assets,
                     latest_current_liabilities, latest_book_value, historic_pe_ratios,
-                    latest_net_income, eps_cagr) 
+                    latest_net_income, eps_cagr, latest_free_cash_flow,
+                    raw_income_data, raw_balance_data, raw_dividend_data, raw_profile_data,
+                    raw_cash_flow_data, raw_key_metrics_data) 
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result['ticker'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  ",".join(map(str, result['roe_list'] if 'roe_list' in result else [])),
                  ",".join(map(str, result['rotc_list'] if 'rotc_list' in result else [])),
@@ -711,7 +771,15 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                  result['latest_shares_outstanding'], result['latest_long_term_debt'],
                  result['latest_short_term_debt'], result['latest_current_assets'],
                  result['latest_current_liabilities'], result['latest_book_value'],
-                 result['historic_pe_ratios'], result['latest_net_income'], result['eps_cagr'])
+                 result['historic_pe_ratios'], result['latest_net_income'], result['eps_cagr'],
+                 result['free_cash_flow'],
+                 json.dumps(result['raw_income_data'] if 'raw_income_data' in result else []),
+                 json.dumps(result['raw_balance_data'] if 'raw_balance_data' in result else []),
+                 json.dumps(result['raw_dividend_data'] if 'raw_dividend_data' in result else {}),
+                 json.dumps(result['raw_profile_data'] if 'raw_profile_data' in result else {}),
+                 json.dumps(result['raw_cash_flow_data'] if 'raw_cash_flow_data' in result else []),
+                 json.dumps(result['raw_key_metrics_data'] if 'raw_key_metrics_data' in result else [])
+                )
             )
             conn.commit()
             analyze_logger.info(f"Saved {result['ticker']} to database with hash {ticker_list_hash}")
@@ -823,7 +891,8 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             "latest_book_value": cached_data['latest_book_value'],
                             "historic_pe_ratios": cached_data['historic_pe_ratios'],
                             "latest_net_income": cached_data['latest_net_income'],
-                            "eps_cagr": cached_data.get('eps_cagr', 0.0)
+                            "eps_cagr": cached_data.get('eps_cagr', 0.0),
+                            "free_cash_flow": cached_data.get('latest_free_cash_flow', 0.0)
                         }
                         return result
                 else:
@@ -866,8 +935,8 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                 shares_outstanding = float(income_data[0]['weightedAverageShsOut']) if income_data and 'weightedAverageShsOut' in income_data[0] else None
                 book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding and shares_outstanding > 0 and shareholder_equity is not None else None
 
-                roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list = await fetch_historical_data(
-                    ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data
+                roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list, free_cash_flow = await fetch_historical_data(
+                    ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data, cash_flow_data
                 )
                 latest_net_income = float(income_data[0]['netIncome']) if income_data and 'netIncome' in income_data[0] else None
                 available_data_years = len(years_available)
@@ -922,7 +991,14 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                     "latest_book_value": latest_book_value,
                     "historic_pe_ratios": historic_pe_ratios,
                     "latest_net_income": latest_net_income,
-                    "eps_cagr": eps_cagr
+                    "eps_cagr": eps_cagr,
+                    "free_cash_flow": free_cash_flow,
+                    "raw_income_data": income_data,
+                    "raw_balance_data": balance_data,
+                    "raw_dividend_data": dividend_data,
+                    "raw_profile_data": profile_data,
+                    "raw_cash_flow_data": cash_flow_data,
+                    "raw_key_metrics_data": key_metrics_data
                 }
 
                 save_to_db(full_result)
@@ -1058,9 +1134,10 @@ def get_stock_data_from_db(ticker):
                 "latest_book_value": stock_dict.get('latest_book_value'),
                 "historic_pe_ratios": json.loads(stock_dict.get('historic_pe_ratios', '[]')),
                 "latest_net_income": stock_dict.get('latest_net_income'),
-                "eps_cagr": stock_dict.get('eps_cagr', 0.0)
+                "eps_cagr": stock_dict.get('eps_cagr', 0.0),
+                "latest_free_cash_flow": stock_dict.get('latest_free_cash_flow', 0.0)
             }
-            analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}")
+            analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}, FCF={stock_dict.get('latest_free_cash_flow', 0.0)}")
             return result
         return None
     except sqlite3.Error as e:
@@ -1069,10 +1146,10 @@ def get_stock_data_from_db(ticker):
     finally:
         conn.close()
 
-async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
-    """Screen NYSE stocks with performance optimizations and selective logging."""
+async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None, min_criteria=6):
+    """Screen NYSE stocks with configurable minimum criteria threshold."""
     exchange = "NYSE"
-    screening_logger.info(f"Starting NYSE Graham screening with {len(tickers) if tickers else 'all'} tickers")
+    screening_logger.info(f"Starting NYSE Graham screening with min_criteria={min_criteria}, {len(tickers) if tickers else 'all'} tickers")
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -1133,18 +1210,18 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
-                if available_data_years >= 10 and common_score is not None and common_score == 6:
+                if available_data_years >= 10 and common_score is not None and common_score >= min_criteria:
                     if log_full:
-                        screening_logger.info(f"{ticker}: Qualified with all 6 criteria met")
+                        screening_logger.info(f"{ticker}: Qualified with {common_score}/{min_criteria} criteria met")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
-                    cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
+                    cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange, min_criteria) VALUES (?, ?, ?, ?, ?, ?)",
+                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange'], min_criteria))
                 else:
                     if log_full:
-                        reason = "Insufficient data years" if available_data_years < 10 else "Did not meet all 6 criteria" if common_score is not None else "No score calculated"
+                        reason = "Insufficient data years" if available_data_years < 10 else f"Score {common_score} below threshold {min_criteria}" if common_score is not None else "No score calculated"
                         screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
@@ -1173,7 +1250,7 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
                         f.write(ticker + '\n')
                 screening_logger.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
 
-        screening_logger.info(f"Completed NYSE screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
+        screening_logger.info(f"Completed NYSE screening with min_criteria={min_criteria}: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
         if error_tickers and total_tickers <= 20:
             screening_logger.info(f"Error tickers: {error_tickers}")
         elif error_tickers:
@@ -1185,10 +1262,10 @@ async def screen_nyse_graham_stocks(batch_size=18, cancel_event=None, tickers=No
     finally:
         conn.close()
 
-async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None):
-    """Screen NASDAQ stocks with performance optimizations and selective logging."""
+async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None, min_criteria=6):
+    """Screen NASDAQ stocks with configurable minimum criteria threshold."""
     exchange = "NASDAQ"
-    screening_logger.info(f"Starting NASDAQ Graham screening with {len(tickers) if tickers else 'all'} tickers")
+    screening_logger.info(f"Starting NASDAQ Graham screening with min_criteria={min_criteria}, {len(tickers) if tickers else 'all'} tickers")
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -1249,18 +1326,18 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
-                if available_data_years >= 10 and common_score is not None and common_score == 6:
+                if available_data_years >= 10 and common_score is not None and common_score >= min_criteria:
                     if log_full:
-                        screening_logger.info(f"{ticker}: Qualified with all 6 criteria met")
+                        screening_logger.info(f"{ticker}: Qualified with {common_score}/{min_criteria} criteria met")
                     qualifying_stocks.append(ticker)
                     common_scores.append(common_score)
                     exchanges.append(result['exchange'])
                     passed_tickers += 1
-                    cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange) VALUES (?, ?, ?, ?, ?)",
-                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange']))
+                    cursor.execute("INSERT OR REPLACE INTO graham_qualifiers (ticker, common_score, date, sector, exchange, min_criteria) VALUES (?, ?, ?, ?, ?, ?)",
+                                (ticker, common_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result['sector'], result['exchange'], min_criteria))
                 else:
                     if log_full:
-                        reason = "Insufficient data years" if available_data_years < 10 else "Did not meet all 6 criteria" if common_score is not None else "No score calculated"
+                        reason = "Insufficient data years" if available_data_years < 10 else f"Score {common_score} below threshold {min_criteria}" if common_score is not None else "No score calculated"
                         screening_logger.info(f"{ticker}: Disqualified - {reason}")
                 
                 processed_tickers += 1
@@ -1289,7 +1366,7 @@ async def screen_nasdaq_graham_stocks(batch_size=18, cancel_event=None, tickers=
                         f.write(ticker + '\n')
                 screening_logger.info(f"Added {len(new_invalid)} new invalid tickers to {invalid_file}")
 
-        screening_logger.info(f"Completed NASDAQ screening: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
+        screening_logger.info(f"Completed NASDAQ screening with min_criteria={min_criteria}: {processed_tickers}/{total_tickers} processed, {passed_tickers} passed, {len(error_tickers)} errors")
         if error_tickers and total_tickers <= 20:
             screening_logger.info(f"Error tickers: {error_tickers}")
         elif error_tickers:
