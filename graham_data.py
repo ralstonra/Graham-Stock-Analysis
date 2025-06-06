@@ -526,7 +526,7 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     div_list = []
     revenue = {}
     balance_data_list = []
-    free_cash_flow = None  # Initialize FCF to None instead of 0.0
+    free_cash_flow = None  # Initialize FCF to None
 
     if not income_data or not balance_data or not dividend_data or not cash_flow_data:
         analyze_logger.error(f"No income, balance, dividend, or cash flow data provided for {ticker}")
@@ -554,10 +554,6 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
             except (ValueError, TypeError) as e:
                 analyze_logger.warning(f"{ticker}: Invalid dividend entry {div_entry}: {str(e)}")
 
-    analyze_logger.debug(f"{ticker}: Dividend dictionary after processing: {div_dict}")
-    if not any(div_dict.values()):
-        analyze_logger.warning(f"No dividend data found for {ticker} in the available years")
-
     # Calculate FCF for the latest year
     if cash_flow_data and cash_flow_data[0]:  # Latest year's cash flow data
         latest_cash_flow = cash_flow_data[0]
@@ -567,7 +563,7 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
             try:
                 operating_cash_flow = float(operating_cash_flow)
                 capex = float(capex)
-                free_cash_flow = operating_cash_flow + capex  # Since capex is typically negative
+                free_cash_flow = operating_cash_flow + capex  # Capex is typically negative
                 analyze_logger.info(f"{ticker}: Calculated FCF = {operating_cash_flow} + {capex} = {free_cash_flow}")
             except (ValueError, TypeError) as e:
                 analyze_logger.error(f"{ticker}: Error converting cash flow data to float: {str(e)}")
@@ -582,7 +578,6 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     # Process data for each year in ascending order
     for year in years_available:
         year_str = str(year)
-        
         income_entry = next((entry for entry in income_data if entry['date'].startswith(year_str)), None)
         balance_entry = next((entry for entry in balance_data if entry['date'].startswith(year_str)), None)
         if not income_entry or not balance_entry:
@@ -609,8 +604,6 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
         balance_data_list.append(balance_entry)
 
     analyze_logger.debug(f"Fetched data for {ticker}: ROE={len(roe_list)}, ROTC={len(rotc_list)}, EPS={len(eps_list)}, Div={len(div_list)}, FCF={free_cash_flow}")
-    analyze_logger.debug(f"{ticker}: EPS List: {eps_list}")
-    analyze_logger.debug(f"{ticker}: Dividend List: {div_list}")
     return roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list, free_cash_flow
 
 def calculate_cagr(start_value, end_value, years):
@@ -909,25 +902,21 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                 if not screening_mode:
                     analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
                     return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
-
+                
                 await asyncio.sleep(DELAY_BETWEEN_CALLS)
                 security_name = ticker_manager.get_security_name(ticker)
                 
+                # Fetch fresh data if cache miss
                 income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
                 if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
-                    missing = []
-                    if not income_data:
-                        missing.append("income_data")
-                    if not balance_data:
-                        missing.append("balance_data")
-                    if not dividend_data:
-                        missing.append("dividend_data")
-                    if not profile_data:
-                        missing.append("profile_data")
-                    if not cash_flow_data:
-                        missing.append("cash_flow_data")
-                    if not key_metrics_data:
-                        missing.append("key_metrics_data")
+                    missing = [name for name, data in [
+                        ("income_data", income_data),
+                        ("balance_data", balance_data),
+                        ("dividend_data", dividend_data),
+                        ("profile_data", profile_data),
+                        ("cash_flow_data", cash_flow_data),
+                        ("key_metrics_data", key_metrics_data)
+                    ] if not data]
                     analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
                     return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
 
@@ -1094,13 +1083,10 @@ def get_stock_data_from_db(ticker):
             columns = [desc[0] for desc in cursor.description]
             stock_dict = dict(zip(columns, row))
             years = [int(y) for y in stock_dict['years'].split(",")] if stock_dict.get('years') else []
-            if not years:
-                analyze_logger.warning(f"No years data found for {ticker} in database")
             roe_list = [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else []
             rotc_list = [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else []
             eps_list = [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else []
             div_list = [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else []
-            # Ensure lists are aligned with years (ascending order)
             if years:
                 data = list(zip(years, roe_list, rotc_list, eps_list, div_list))
                 data.sort(key=lambda x: x[0])  # Sort by year (ascending)
@@ -1141,7 +1127,7 @@ def get_stock_data_from_db(ticker):
                 "historic_pe_ratios": json.loads(stock_dict.get('historic_pe_ratios', '[]')),
                 "latest_net_income": stock_dict.get('latest_net_income'),
                 "eps_cagr": stock_dict.get('eps_cagr', 0.0),
-                "latest_free_cash_flow": stock_dict.get('latest_free_cash_flow', 0.0)
+                "latest_free_cash_flow": stock_dict.get('latest_free_cash_flow'),
             }
             analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}, FCF={stock_dict.get('latest_free_cash_flow', 0.0)}")
             return result

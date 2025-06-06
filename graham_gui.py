@@ -1109,27 +1109,33 @@ class GrahamScreeningApp:
                 else:
                     cell.alignment = Alignment(wrap_text=False, horizontal='left', vertical='center')
 
-    def export_qualifying_stocks(self, exchange):
-        """Export qualifying stocks to an Excel workbook with specified formatting."""
+    def export_qualifying_stocks(self, exchange, min_criteria):
+        analyze_logger.debug(f"Exporting {exchange} qualifying stocks with min_criteria={min_criteria}")
+
         conn, cursor = get_stocks_connection()
         try:
-            # Fetch qualifying tickers and data including additional fields
-            cursor.execute(""" 
-                SELECT g.ticker, g.sector, g.common_score, s.company_name, s.years, s.roe, s.rotc, s.eps, s.dividend,
-                    s.debt_to_equity, s.eps_ttm, s.book_value_per_share, s.latest_revenue, s.available_data_years, s.balance_data,
-                    s.latest_net_income, s.latest_long_term_debt, s.eps_cagr, s.latest_total_assets, s.latest_total_liabilities,
-                    s.latest_shares_outstanding, s.latest_current_assets, s.latest_current_liabilities, s.raw_income_data,
-                    s.key_metrics_data, s.latest_short_term_debt, s.latest_book_value
-                FROM graham_qualifiers g
-                LEFT JOIN stocks s ON g.ticker = s.ticker
-                WHERE g.exchange=?
-            """, (exchange,))
-            qualifiers = cursor.fetchall()
-            if not qualifiers:
-                messagebox.showinfo("No Data", f"No {exchange} qualifying stocks to export.")
+            cursor.execute("""
+                SELECT s.ticker, s.company_name, g.common_score, s.date, s.roe, s.rotc, s.eps, s.dividend,
+                    s.ticker_list_hash, s.balance_data, s.timestamp, s.debt_to_equity, s.eps_ttm,
+                    s.book_value_per_share, s.latest_revenue, s.available_data_years, s.sector,
+                    s.years, s.latest_total_assets, s.latest_total_liabilities, s.latest_shares_outstanding,
+                    s.latest_long_term_debt, s.latest_short_term_debt, s.latest_current_assets,
+                    s.latest_current_liabilities, s.latest_book_value, s.historic_pe_ratios,
+                    s.latest_net_income, s.eps_cagr, s.latest_free_cash_flow, s.raw_income_data,
+                    s.raw_balance_data, s.raw_dividend_data, s.raw_profile_data, s.raw_cash_flow_data,
+                    s.raw_key_metrics_data
+                FROM stocks s
+                JOIN graham_qualifiers g ON s.ticker = g.ticker
+                WHERE g.exchange = ? AND g.common_score >= ?
+                ORDER BY g.common_score DESC, s.ticker ASC
+            """, (exchange, min_criteria))
+            results = cursor.fetchall()
+            if not results:
+                messagebox.showinfo("No Results", f"No {exchange} stocks meet the Graham criteria with minimum score {min_criteria}.")
+                analyze_logger.info(f"No qualifying {exchange} stocks found with min_criteria={min_criteria}")
                 return
 
-            tickers = [row[0] for row in qualifiers]
+            tickers = [row[0] for row in results]
             prices = self.fetch_current_prices(tickers)
 
             # Create workbook
@@ -1142,8 +1148,8 @@ class GrahamScreeningApp:
 
             # Process stock data for summary tabs
             stock_data_list = []
-            for row in qualifiers:
-                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_current_assets, latest_current_liabilities, raw_income_data, key_metrics_data, latest_short_term_debt, latest_book_value = row
+            for row in results:
+                ticker, company_name, common_score, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, timestamp, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, sector, years, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_long_term_debt, latest_short_term_debt, latest_current_assets, latest_current_liabilities, latest_book_value, historic_pe_ratios, latest_net_income, eps_cagr, latest_free_cash_flow, raw_income_data, raw_balance_data, raw_dividend_data, raw_profile_data, raw_cash_flow_data, raw_key_metrics_data = row
                 price = prices.get(ticker, "N/A")
                 if price == "N/A" or not isinstance(price, (int, float)):
                     continue  # Skip stocks without valid price data
@@ -1174,20 +1180,20 @@ class GrahamScreeningApp:
                     "current_price": price,
                     "intrinsic_value": intrinsic_value if not pd.isna(intrinsic_value) else "N/A",
                     "buy_price": buy_price if buy_price != "N/A" else "N/A",
-                    "sell_price": sell_price if sell_price != "N/A" else "N/A",
+                    "sell_price": sell_price if buy_price != "N/A" else "N/A",
                     "latest_total_assets": latest_total_assets,
                     "latest_total_liabilities": latest_total_liabilities,
                     "latest_shares_outstanding": latest_shares_outstanding,
                     "latest_current_assets": latest_current_assets,
                     "latest_current_liabilities": latest_current_liabilities,
-                    "free_cash_flow": None  # Placeholder; calculate or fetch as needed
+                    "free_cash_flow": latest_free_cash_flow
                 }
                 stock_data_list.append(stock_data)
 
             # Sort stock data list by company name
             stock_data_list.sort(key=lambda x: x["company_name"])
 
-            # Define financial sectors (adjust based on actual sector names in your data)
+            # Define financial sectors
             financial_sectors = ['Financial Services', 'Finance', 'Banking', 'financials']
 
             # Make case-insensitive comparison
@@ -1252,14 +1258,14 @@ class GrahamScreeningApp:
             else:
                 print("No financial stocks to create 'Financial Winners' sheet")
 
-            # Sort qualifiers by ticker for individual sheets
-            qualifiers.sort(key=lambda x: x[0])  # Assuming ticker is the first element
+            # Sort results by ticker for individual sheets
+            results.sort(key=lambda x: x[0])  # Assuming ticker is the first element
 
             # Create individual stock sheets
-            for row in qualifiers:
-                ticker, sector, common_score, company_name, years, roe, rotc, eps, dividend, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, balance_data, latest_net_income, latest_long_term_debt, eps_cagr, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_current_assets, latest_current_liabilities, raw_income_data, key_metrics_data, latest_short_term_debt, latest_book_value = row
+            for row in results:
+                ticker, company_name, common_score, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, timestamp, debt_to_equity, eps_ttm, book_value_per_share, latest_revenue, available_data_years, sector, years, latest_total_assets, latest_total_liabilities, latest_shares_outstanding, latest_long_term_debt, latest_short_term_debt, latest_current_assets, latest_current_liabilities, latest_book_value, historic_pe_ratios, latest_net_income, eps_cagr, latest_free_cash_flow, raw_income_data, raw_balance_data, raw_dividend_data, raw_profile_data, raw_cash_flow_data, raw_key_metrics_data = row
                 price = prices.get(ticker, "N/A")
-                stock_sheet = wb.create_sheet(ticker)
+                stock_sheet = wb.create_sheet(ticker[:31])  # Truncate to 31 chars for Excel compatibility
 
                 # Set row heights to 15 for rows 1 to 55
                 for row_num in range(1, 56):
@@ -1649,10 +1655,15 @@ class GrahamScreeningApp:
                     stock_sheet['C17'].value = "N/A"
                 stock_sheet['C17'].alignment = Alignment(horizontal='center', vertical='center')
 
-                # Assuming free_cash_flow is calculated or fetched; placeholder for now
-                free_cash_flow = 0  # Replace with actual calculation or data
-                stock_sheet['C18'].value = free_cash_flow
-                stock_sheet['C18'].number_format = '$#,##0'
+                # C18: Free Cash Flow ($M)
+                analyze_logger.debug(f"{ticker}: Raw latest_free_cash_flow from DB = {latest_free_cash_flow}")
+                if isinstance(latest_free_cash_flow, (int, float)) and latest_free_cash_flow is not None:
+                    stock_sheet['C18'].value = latest_free_cash_flow / 1_000_000
+                    stock_sheet['C18'].number_format = '$#,##0'
+                    analyze_logger.debug(f"{ticker}: Set FCF in C18 = {latest_free_cash_flow / 1_000_000} $M")
+                else:
+                    stock_sheet['C18'].value = "N/A"
+                    analyze_logger.warning(f"{ticker}: FCF unavailable or invalid for C18 (value: {latest_free_cash_flow})")
                 stock_sheet['C18'].alignment = Alignment(horizontal='center', vertical='center')
 
                 if latest_shares_outstanding is not None:
@@ -1785,7 +1796,7 @@ class GrahamScreeningApp:
                 stock_sheet['M26'].alignment = Alignment(horizontal='center', vertical='center')
 
                 # M27 not specified, assuming placeholder or same as M23
-                stock_sheet['M27'].value = "=M23"  # Placeholder assumption
+                stock_sheet['M27'].value = "=M23"
                 stock_sheet['M27'].number_format = '$#,##0.00'
                 stock_sheet['M27'].alignment = Alignment(horizontal='center', vertical='center')
 
@@ -1874,7 +1885,7 @@ class GrahamScreeningApp:
                 book_value_dict = {entry['date'][:4]: float(entry['totalStockholdersEquity']) for entry in balance_data_list if 'date' in entry and 'totalStockholdersEquity' in entry}
                 book_value_list = [book_value_dict.get(str(year), None) for year in years_list[-10:]] if years_list else []
 
-                key_metrics_list = json.loads(key_metrics_data) if key_metrics_data else []
+                key_metrics_list = json.loads(raw_key_metrics_data) if raw_key_metrics_data else []
                 pe_ratio_list = [float(entry['peRatio']) for entry in key_metrics_list if 'peRatio' in entry and entry['peRatio'] is not None]
                 average_pe = sum(pe_ratio_list) / len(pe_ratio_list) if pe_ratio_list else "N/A"
 
@@ -2188,17 +2199,18 @@ class GrahamScreeningApp:
             if file_path:
                 wb.save(file_path)
                 messagebox.showinfo("Export Successful", f"Qualifying stocks exported to {file_path}")
+                analyze_logger.info(f"Exported {exchange} qualifying stocks to {file_path}")
         except Exception as e:
-            analyze_logger.error(f"Error exporting qualifying stocks: {e}")
+            analyze_logger.error(f"Error exporting {exchange} qualifying stocks: {str(e)}")
             messagebox.showerror("Export Error", f"An error occurred while exporting: {str(e)}")
         finally:
             conn.close()
                 
     def export_nyse_qualifying_stocks(self):
-        self.export_qualifying_stocks("NYSE")
+        self.export_qualifying_stocks("NYSE", min_criteria=self.min_criteria_var.get())
 
     def export_nasdaq_qualifying_stocks(self):
-        self.export_qualifying_stocks("NASDAQ")
+        self.export_qualifying_stocks("NASDAQ", min_criteria=self.min_criteria_var.get())
 
     def check_file_age(self):
         files = [
