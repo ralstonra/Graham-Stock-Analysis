@@ -26,9 +26,12 @@ import shutil
 import requests
 import ftplib
 import openpyxl
-from openpyxl.chart import LineChart, Reference
+from openpyxl.chart import LineChart, Reference, Series, ScatterChart
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.axis import ChartLines
 
 FAVORITES_LOCK = threading.Lock()
 DATA_DIR = BASE_DIR
@@ -1108,12 +1111,6 @@ class GrahamScreeningApp:
 
     def export_qualifying_stocks(self, exchange):
         """Export qualifying stocks to an Excel workbook with specified formatting."""
-        import json  # Ensure json is imported for parsing raw_income_data
-        from openpyxl.chart import ScatterChart, Series, Reference
-        from openpyxl.chart.marker import Marker
-        from openpyxl.chart.shapes import GraphicalProperties
-        from openpyxl.chart.axis import ChartLines
-
         conn, cursor = get_stocks_connection()
         try:
             # Fetch qualifying tickers and data including additional fields
@@ -1794,7 +1791,8 @@ class GrahamScreeningApp:
 
                 # Set A29: "Shares Outstanding"
                 stock_sheet['A29'].value = "Shares Outstanding"
-                stock_sheet['A29'].alignment = Alignment(horizontal='left', vertical='center')
+                stock_sheet['A29'].font = Font(bold=True)
+                stock_sheet['A29'].alignment = Alignment(horizontal='center', vertical='center')
 
                 # Populate B29:K29 with shares outstanding from raw_income_data
                 if raw_income_data:

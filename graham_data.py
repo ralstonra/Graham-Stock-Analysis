@@ -183,14 +183,7 @@ def get_stocks_connection():
                     exchange TEXT,
                     min_criteria INTEGER
                 )''')
-                cursor.execute("PRAGMA table_info(graham_qualifiers)")
-                columns = [col[1] for col in cursor.fetchall()]
-                if 'min_criteria' not in columns:
-                    cursor.execute("ALTER TABLE graham_qualifiers ADD COLUMN min_criteria INTEGER")
-                    analyze_logger.info("Added 'min_criteria' column to graham_qualifiers table")
-                else:
-                    analyze_logger.debug("'min_criteria' column already exists in graham_qualifiers table")
-                
+                                
                 # Create the 'screening_progress' table if it doesn't exist
                 cursor.execute('''CREATE TABLE IF NOT EXISTS screening_progress (
                     exchange TEXT,
@@ -533,11 +526,11 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     div_list = []
     revenue = {}
     balance_data_list = []
-    free_cash_flow = 0.0  # Initialize FCF
+    free_cash_flow = None  # Initialize FCF to None instead of 0.0
 
     if not income_data or not balance_data or not dividend_data or not cash_flow_data:
         analyze_logger.error(f"No income, balance, dividend, or cash flow data provided for {ticker}")
-        return [], [], [], [], [], {}, [], 0.0
+        return [], [], [], [], [], {}, [], None
 
     years_income = [int(entry['date'].split('-')[0]) for entry in income_data if 'date' in entry]
     years_balance = [int(entry['date'].split('-')[0]) for entry in balance_data if 'date' in entry]
@@ -545,7 +538,7 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
 
     if not years_available:
         analyze_logger.error(f"No common years found for {ticker} between income and balance data")
-        return [], [], [], [], [], {}, [], 0.0
+        return [], [], [], [], [], {}, [], None
 
     # Fetch dividend data correctly from 'historical' key
     dividend_history = dividend_data.get('historical', [])
@@ -568,10 +561,23 @@ async def fetch_historical_data(ticker: str, exchange="Stock", update_rate_limit
     # Calculate FCF for the latest year
     if cash_flow_data and cash_flow_data[0]:  # Latest year's cash flow data
         latest_cash_flow = cash_flow_data[0]
-        operating_cash_flow = float(latest_cash_flow.get('netCashProvidedByOperatingActivities', 0))
-        capex = float(latest_cash_flow.get('capitalExpenditure', 0))  # Typically negative
-        free_cash_flow = operating_cash_flow + capex  # Add since capex is negative
-        analyze_logger.debug(f"{ticker}: Calculated FCF = {operating_cash_flow} + {capex} = {free_cash_flow}")
+        operating_cash_flow = latest_cash_flow.get('netCashProvidedByOperatingActivities')
+        capex = latest_cash_flow.get('capitalExpenditure')
+        if operating_cash_flow is not None and capex is not None:
+            try:
+                operating_cash_flow = float(operating_cash_flow)
+                capex = float(capex)
+                free_cash_flow = operating_cash_flow + capex  # Since capex is typically negative
+                analyze_logger.info(f"{ticker}: Calculated FCF = {operating_cash_flow} + {capex} = {free_cash_flow}")
+            except (ValueError, TypeError) as e:
+                analyze_logger.error(f"{ticker}: Error converting cash flow data to float: {str(e)}")
+                free_cash_flow = None
+        else:
+            analyze_logger.warning(f"{ticker}: Missing cash flow data - operating_cash_flow: {operating_cash_flow}, capex: {capex}")
+            free_cash_flow = None
+    else:
+        analyze_logger.warning(f"{ticker}: No cash flow data available")
+        free_cash_flow = None
 
     # Process data for each year in ascending order
     for year in years_available:
