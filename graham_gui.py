@@ -11,7 +11,7 @@ import os
 import json
 import yfinance as yf
 from datetime import datetime, timedelta
-from graham_data import (screen_nasdaq_graham_stocks, screen_nyse_graham_stocks, fetch_batch_data,
+from graham_data import (screen_exchange_graham_stocks, fetch_batch_data,
                          fetch_stock_data, get_stocks_connection, fetch_with_multiple_keys_async,
                          NYSE_LIST_FILE, NASDAQ_LIST_FILE, TickerManager, get_file_hash,
                          calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
@@ -94,6 +94,36 @@ class GrahamScreeningApp:
         self.create_widgets()
 
         paid_rate_limiter.on_sleep = self.on_rate_limit_sleep
+
+        # New: Tooltips
+        self.create_tooltip(self.entry, "Enter comma-separated tickers, e.g., AOS, AAPL")
+        self.create_tooltip(self.search_entry, "Search by ticker or company name")
+        self.create_tooltip(self.favorite_menu, "Select a saved favorites list")
+        self.create_tooltip(self.margin_of_safety_label, "Discount to intrinsic value for safety margin")
+        self.create_tooltip(self.expected_return_label, "Premium above intrinsic value for sell target")
+        self.create_tooltip(self.analyze_button, "Analyze the entered tickers")
+        self.create_tooltip(self.progress_bar, "Shows progress of screening or analysis")
+
+    # New: Helper method for tooltips
+    def create_tooltip(self, widget: tk.Widget, text: str) -> None:
+        tooltip = tk.Toplevel(self.root)
+        tooltip.withdraw()
+        tooltip.wm_overrideredirect(True)
+        label = tk.Label(tooltip, text=text, background="yellow", relief="solid", borderwidth=1, padx=5, pady=3)
+        label.pack()
+
+        def show_tooltip(event):
+            x, y, _, _ = widget.bbox("insert")
+            x += widget.winfo_rootx() + 25
+            y += widget.winfo_rooty() + 25
+            tooltip.wm_geometry(f"+{x}+{y}")
+            tooltip.deiconify()
+
+        def hide_tooltip(event):
+            tooltip.withdraw()
+
+        widget.bind("<Enter>", show_tooltip)
+        widget.bind("<Leave>", hide_tooltip)
 
     def on_rate_limit_sleep(self, sleep_time):
         message = f"Rate limit reached, pausing for {sleep_time / 60:.1f} minutes"
@@ -226,6 +256,21 @@ class GrahamScreeningApp:
         ttk.Label(self.right_frame, text="Min Graham Criteria:").grid(row=9, column=0, pady=2, sticky="w")
         self.min_criteria_menu = ttk.Combobox(self.right_frame, textvariable=self.min_criteria_var, values=[4, 5, 6], state="readonly")
         self.min_criteria_menu.grid(row=10, column=0, pady=2, sticky="ew")
+
+        # Add sector filter selector below min criteria
+        self.sector_filter_var = tk.StringVar(value="All")
+        ttk.Label(self.right_frame, text="Sector Filter:").grid(row=11, column=0, pady=2, sticky="w")
+        self.sector_menu = ttk.Combobox(
+            self.right_frame, 
+            textvariable=self.sector_filter_var, 
+            values=[
+                "All", "Energy", "Materials", "Industrials", "Consumer Discretionary", 
+                "Consumer Staples", "Health Care", "Financials", "Information Technology", 
+                "Communication Services", "Utilities", "Real Estate", "Unknown"
+            ], 
+            state="readonly"
+        )
+        self.sector_menu.grid(row=12, column=0, pady=2, sticky="ew")
 
         # Treeview and Tabs
         self.full_tree_frame = ttk.Frame(self.main_frame)
@@ -361,7 +406,7 @@ class GrahamScreeningApp:
             self.status_label.config(text="Cancelling screening...")
 
     # Screening Logic
-    def run_screening(self, exchange, screen_func):
+    def run_screening(self, exchange: str, screen_func) -> None:
         if self.screening_active:
             messagebox.showwarning("Warning", f"A {exchange} screening is already in progress.")
             return
@@ -404,10 +449,12 @@ class GrahamScreeningApp:
         self.screening_active = True
 
         min_criteria = self.min_criteria_var.get()
+        sector_filter = self.sector_filter_var.get() if self.sector_filter_var.get() != "All" else None  # New: Get sector
         async def screening_task():
             try:
                 await self.ticker_manager.initialize()
                 qualifying_stocks, common_scores, exchanges, error_tickers = await screen_func(
+                    exchange=exchange,  # New param
                     batch_size=50,
                     cancel_event=self.cancel_event,
                     root=self.root,
@@ -415,7 +462,8 @@ class GrahamScreeningApp:
                     refresh_favorites_dropdown=self.refresh_favorites_dropdown,
                     ticker_manager=self.ticker_manager,
                     update_rate_limit=self.update_rate_limit,
-                    min_criteria=min_criteria  # Pass the selected threshold
+                    min_criteria=min_criteria,
+                    sector_filter=sector_filter  # New: Pass sector
                 )
                 screening_logger.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
                 if not self.cancel_event.is_set():
@@ -459,11 +507,11 @@ class GrahamScreeningApp:
 
         self.task_queue.put(screening_task())
 
-    def run_nyse_screening(self):
-        self.run_screening("NYSE", screen_nyse_graham_stocks)
+    def run_nyse_screening(self) -> None:
+        self.run_screening("NYSE", screen_exchange_graham_stocks)  # Updated to use refactored func
 
-    def run_nasdaq_screening(self):
-        self.run_screening("NASDAQ", screen_nasdaq_graham_stocks)
+    def run_nasdaq_screening(self) -> None:
+        self.run_screening("NASDAQ", screen_exchange_graham_stocks)  # Updated to use refactored func
 
     # Data Fetching and Analysis
     async def fetch_company_name(self, ticker):
@@ -626,7 +674,7 @@ class GrahamScreeningApp:
         self.root.update()
 
         analyze_logger.info(f"Fetching data for {len(tickers)} tickers with margin_of_safety={self.margin_of_safety_var.get()/100}, expected_return={self.expected_return_var.get()/100}")
-        results, error_tickers = await fetch_batch_data(
+        results, error_tickers, cache_hits = await fetch_batch_data(
             tickers,
             screening_mode=False,
             expected_return=self.expected_return_var.get() / 100,
@@ -638,7 +686,7 @@ class GrahamScreeningApp:
         valid_results = [r for r in results if 'error' not in r]
         passed_tickers = sum(1 for r in valid_results if r.get('graham_score', 0) >= 5 and r.get('available_data_years', 0) >= 10)
 
-        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} errors")
+        analyze_logger.info(f"Analysis complete: {len(valid_results)} valid results, {len(error_tickers)} errors, {cache_hits} cache hits")
         if error_tickers:
             analyze_logger.warning(f"Error tickers: {error_tickers}")
             error_summary = "\n".join(error_tickers)
@@ -669,7 +717,10 @@ class GrahamScreeningApp:
                 f"${self.format_float(result['sell_price'])}"
             ), tags=tags)
 
-        cache_hits = sum(1 for t in tickers if t in self.ticker_cache)
+            # Cache the result in ticker_cache
+            with self.ticker_cache_lock:
+                self.ticker_cache[result['ticker']] = result
+
         analyze_logger.info(f"Cache usage: {cache_hits} hits out of {len(tickers)} total tickers")
         self.root.after(0, lambda: self.update_cache_usage(cache_hits, len(tickers)))
         self.root.after(0, lambda: self.update_progress_animated(100, tickers, passed_tickers))
@@ -2423,7 +2474,7 @@ class GrahamScreeningApp:
         """
         messagebox.showinfo("Help", help_text)
 
-    def filter_tree(self, event):
+    def filter_tree(self, event) -> None:
         """Filter the treeview based on the search term entered in the search entry widget."""
         search_term = self.search_entry.get().strip().upper()
 
@@ -2434,11 +2485,11 @@ class GrahamScreeningApp:
         # Connect to the database
         conn, cursor = get_stocks_connection()
         try:
-            # If there's a search term, filter stocks by ticker; otherwise, show all stocks
+            # If there's a search term, filter stocks by ticker or company_name (case-insensitive); otherwise, show all stocks
             if search_term:
                 cursor.execute(
-                    "SELECT ticker, company_name, common_score FROM stocks WHERE ticker LIKE ?",
-                    (f"%{search_term}%",)
+                    "SELECT ticker, company_name, common_score FROM stocks WHERE UPPER(ticker) LIKE ? OR UPPER(company_name) LIKE ?",
+                    (f"%{search_term}%", f"%{search_term}%")
                 )
             else:
                 cursor.execute("SELECT ticker, company_name, common_score FROM stocks")
