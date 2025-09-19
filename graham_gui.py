@@ -12,17 +12,21 @@ import json
 import yfinance as yf
 from decouple import config
 from datetime import datetime, timedelta
-from graham_data import (screen_exchange_graham_stocks, fetch_batch_data,
-                         fetch_stock_data, get_stocks_connection, fetch_with_multiple_keys_async,
-                         NYSE_LIST_FILE, NASDAQ_LIST_FILE, TickerManager, get_file_hash,
-                         calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
-                         clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db,
-                         get_sector_growth_rate, calculate_cagr, get_aaa_yield, get_bank_metrics,
-                         get_tangible_book_value_per_share)
-from config import (
-    BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, 
-    CACHE_EXPIRY, screening_logger, analyze_logger, USER_DATA_DIR, FRED_API_KEY
+import aiohttp
+from graham_data import (
+    screen_exchange_graham_stocks, fetch_batch_data, fetch_stock_data,
+    get_stocks_connection, fetch_with_multiple_keys_async, NYSE_LIST_FILE,
+    NASDAQ_LIST_FILE, TickerManager, get_file_hash, calculate_graham_value,
+    calculate_graham_score_8, calculate_common_criteria, clear_in_memory_caches,
+    save_qualifying_stocks_to_favorites, get_stock_data_from_db,
+    get_sector_growth_rate, calculate_cagr, get_aaa_yield, get_bank_metrics,
+    get_tangible_book_value_per_share
 )
+from config import (
+    BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, CACHE_EXPIRY,
+    screening_logger, analyze_logger, USER_DATA_DIR, FRED_API_KEY
+)
+from graham_utils import paid_rate_limiter, free_rate_limiter
 import queue
 import shutil
 import requests
@@ -47,6 +51,7 @@ class GrahamScreeningApp:
         self.root = root
         self.root.title("Stock Analysis (Graham Defensive)")
         self.root.geometry("1200x900")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)  # Handle window close
 
         # Variables
         self.nyse_screen_var = tk.BooleanVar(value=False)
@@ -60,293 +65,343 @@ class GrahamScreeningApp:
         self.analysis_lock = threading.Lock()
         self.ticker_cache = {}
         self.ticker_cache_lock = threading.Lock()
+        self.ticker_init_complete = threading.Event()  # New event for TickerManager initialization
 
-        # Asyncio Thread Setup
-        self.task_queue = queue.Queue()
-        self.asyncio_thread = threading.Thread(target=self.run_asyncio_loop, args=(self.task_queue,), daemon=True)
-        self.asyncio_thread.start()
+        try:
+            # Asyncio Thread Setup
+            self.task_queue = queue.Queue()
+            self.asyncio_loop_started = threading.Event()
+            self.asyncio_thread = threading.Thread(target=self.run_asyncio_loop, args=(self.task_queue,), daemon=True)
+            self.asyncio_thread.start()
+            # Wait for the asyncio loop to start
+            if not self.asyncio_loop_started.wait(timeout=2.0):
+                raise RuntimeError("Asyncio loop failed to start within 2 seconds")
+            # Initialize TickerManager and wait for completion
+            self.task_queue.put(self.initialize_ticker_manager())
+            if not self.ticker_init_complete.wait(timeout=5.0):
+                raise RuntimeError("TickerManager initialization timed out")
 
-        # Main Frame Layout
-        self.main_frame = ttk.Frame(root)
-        self.main_frame.pack(expand=True, fill="both", padx=5, pady=5)
-        self.main_frame.grid_rowconfigure(0, weight=3)
-        self.main_frame.grid_rowconfigure(1, weight=1)
-        self.main_frame.grid_columnconfigure((0, 1, 2), weight=1, minsize=400)
+            # Main Frame Layout
+            self.main_frame = ttk.Frame(root)
+            self.main_frame.pack(expand=True, fill="both", padx=5, pady=5)
+            self.main_frame.grid_rowconfigure(0, weight=3)
+            self.main_frame.grid_rowconfigure(1, weight=1)
+            self.main_frame.grid_columnconfigure((0, 1, 2), weight=1, minsize=400)
 
-        # Sub-Frames
-        self.left_frame = ttk.Frame(self.main_frame, width=400)
-        self.middle_frame = ttk.Frame(self.main_frame, width=400)
-        self.right_frame = ttk.Frame(self.main_frame, width=400)
+            # Sub-Frames
+            self.left_frame = ttk.Frame(self.main_frame, width=400)
+            self.middle_frame = ttk.Frame(self.main_frame, width=400)
+            self.right_frame = ttk.Frame(self.main_frame, width=400)
 
-        self.left_frame.grid(row=0, column=0, sticky="nsew", padx=2)
-        self.middle_frame.grid(row=0, column=1, sticky="nsew", padx=2)
-        self.right_frame.grid(row=0, column=2, sticky="nsew", padx=2)
+            self.left_frame.grid(row=0, column=0, sticky="nsew", padx=2)
+            self.middle_frame.grid(row=0, column=1, sticky="nsew", padx=2)
+            self.right_frame.grid(row=0, column=2, sticky="nsew", padx=2)
 
-        self.left_frame.grid_columnconfigure(0, weight=1)
-        self.left_frame.grid_rowconfigure(tuple(range(19)), weight=1)
-        self.middle_frame.grid_columnconfigure(0, weight=1)
-        self.right_frame.grid_columnconfigure(0, weight=1)
+            self.left_frame.grid_columnconfigure(0, weight=1)
+            self.left_frame.grid_rowconfigure(tuple(range(19)), weight=1)
+            self.middle_frame.grid_columnconfigure(0, weight=1)
+            self.right_frame.grid_columnconfigure(0, weight=1)
 
-        # Styling
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TLabel", font=("Helvetica", 9), background="#f0f0f0")
-        style.configure("TButton", font=("Helvetica", 9), padding=2)
-        style.configure("TCheckbutton", font=("Helvetica", 9))
-        style.configure("TEntry", font=("Helvetica", 9))
-        style.configure("TCombobox", font=("Helvetica", 9))
-        style.configure("TProgressbar", thickness=15)
+            # Styling
+            style = ttk.Style()
+            style.theme_use("clam")
+            style.configure("TLabel", font=("Helvetica", 9), background="#f0f0f0")
+            style.configure("TButton", font=("Helvetica", 9), padding=2)
+            style.configure("TCheckbutton", font=("Helvetica", 9))
+            style.configure("TEntry", font=("Helvetica", 9))
+            style.configure("TCombobox", font=("Helvetica", 9))
+            style.configure("TProgressbar", thickness=15)
+            style.configure("Invalid.TEntry", fieldbackground="pink")  # For invalid ticker validation
 
-        self.create_widgets()
+            self.create_widgets()
+            self.root.update()  # Force GUI update after widget creation
 
-        paid_rate_limiter.on_sleep = self.on_rate_limit_sleep
+            paid_rate_limiter.on_sleep = self.on_rate_limit_sleep
 
-        # New: Tooltips
-        self.create_tooltip(self.entry, "Enter comma-separated tickers, e.g., AOS, AAPL")
-        self.create_tooltip(self.search_entry, "Search by ticker or company name")
-        self.create_tooltip(self.favorite_menu, "Select a saved favorites list")
-        self.create_tooltip(self.margin_of_safety_label, "Discount to intrinsic value for safety margin")
-        self.create_tooltip(self.expected_return_label, "Premium above intrinsic value for sell target")
-        self.create_tooltip(self.analyze_button, "Analyze the entered tickers")
-        self.create_tooltip(self.progress_bar, "Shows progress of screening or analysis")
+            # Tooltips (ensure widgets are created before setting tooltips)
+            if hasattr(self, 'entry'):
+                self.create_tooltip(self.entry, "Enter comma-separated tickers, e.g., AOS, AAPL")
+            if hasattr(self, 'search_entry'):
+                self.create_tooltip(self.search_entry, "Search by ticker or company name")
+            if hasattr(self, 'favorite_menu'):
+                self.create_tooltip(self.favorite_menu, "Select a saved favorites list")
+            if hasattr(self, 'margin_of_safety_label'):
+                self.create_tooltip(self.margin_of_safety_label, "Discount to intrinsic value for safety margin")
+            if hasattr(self, 'expected_return_label'):
+                self.create_tooltip(self.expected_return_label, "Premium above intrinsic value for sell target")
+            if hasattr(self, 'analyze_button'):
+                self.create_tooltip(self.analyze_button, "Analyze the entered tickers")
+            if hasattr(self, 'progress_bar'):
+                self.create_tooltip(self.progress_bar, "Shows progress of screening or analysis")
 
-        self.check_for_updates()
+            self.check_for_updates()
+        except Exception as e:
+            analyze_logger.error(f"Error initializing GUI: {str(e)}", exc_info=True)
+            messagebox.showerror("Initialization Error", f"Failed to initialize the GUI: {str(e)}")
+            self.root.quit()
 
-    # New: Helper method for tooltips
-    def create_tooltip(self, widget: tk.Widget, text: str) -> None:
-        tooltip = tk.Toplevel(self.root)
-        tooltip.withdraw()
-        tooltip.wm_overrideredirect(True)
-        label = tk.Label(tooltip, text=text, background="yellow", relief="solid", borderwidth=1, padx=5, pady=3)
-        label.pack()
+    async def initialize_ticker_manager(self):
+        """Initialize TickerManager asynchronously and signal completion."""
+        try:
+            await self.ticker_manager.initialize()
+            self.ticker_init_complete.set()
+        except Exception as e:
+            analyze_logger.error(f"Error initializing TickerManager: {str(e)}", exc_info=True)
+            self.ticker_init_complete.set()  # Set anyway to avoid deadlock
 
-        def show_tooltip(event):
-            x, y, _, _ = widget.bbox("insert")
-            x += widget.winfo_rootx() + 25
-            y += widget.winfo_rooty() + 25
-            tooltip.wm_geometry(f"+{x}+{y}")
-            tooltip.deiconify()
-
-        def hide_tooltip(event):
-            tooltip.withdraw()
-
-        widget.bind("<Enter>", show_tooltip)
-        widget.bind("<Leave>", hide_tooltip)
+    def on_closing(self):
+        """Handle window close event to stop asyncio thread."""
+        self.task_queue.put(None)  # Signal the asyncio thread to stop
+        self.asyncio_thread.join(timeout=2)
+        self.root.destroy()
 
     def on_rate_limit_sleep(self, sleep_time):
-        message = f"Rate limit reached, pausing for {sleep_time / 60:.1f} minutes"
+        message = f"Rate limit reached, using {'free key' if sleep_time > 60 else 'paid key'}, pausing for {sleep_time / 60:.1f} minutes"
         self.root.after(0, lambda: self.rate_limit_label.config(text=message))
 
     def run_asyncio_loop(self, task_queue):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        """Run the asyncio event loop in a separate thread."""
+        self.asyncio_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.asyncio_loop)
+        self.asyncio_loop_started.set()  # Signal that the loop has started
         while True:
             coro = task_queue.get()
             if coro is None:
                 break
-            loop.run_until_complete(coro)
-        loop.close()
+            try:
+                self.asyncio_loop.run_until_complete(coro)
+            except Exception as e:
+                analyze_logger.error(f"Error in asyncio task: {str(e)}", exc_info=True)
+        self.asyncio_loop.close()
 
     def create_widgets(self):
-        # Left Frame Widgets (Analyze Stocks)
-        self.left_frame.grid_rowconfigure(tuple(range(15)), weight=1)
+        """Create all GUI widgets with error handling."""
+        try:
+            # Left Frame Widgets (Analyze Stocks)
+            self.left_frame.grid_rowconfigure(tuple(range(15)), weight=1)
 
-        ttk.Label(self.left_frame, text="Enter Stock Tickers (comma-separated, e.g., AOS, AAPL):").grid(row=0, column=0, pady=2, sticky="ew")
-        self.entry = ttk.Entry(self.left_frame, width=50)
-        self.entry.grid(row=1, column=0, pady=2, sticky="ew")
-        self.entry.bind('<FocusOut>', lambda e: self.validate_tickers())
+            ttk.Label(self.left_frame, text="Enter Stock Tickers (comma-separated, e.g., AOS, AAPL):").grid(row=0, column=0, pady=2, sticky="ew")
+            self.entry = ttk.Entry(self.left_frame, width=50)
+            self.entry.grid(row=1, column=0, pady=2, sticky="ew")
+            self.entry.bind('<FocusOut>', lambda e: self.validate_tickers())
 
-        ttk.Label(self.left_frame, text="Search Results:").grid(row=2, column=0, pady=2, sticky="ew")
-        self.search_entry = ttk.Entry(self.left_frame, width=50)
-        self.search_entry.grid(row=3, column=0, pady=2, sticky="ew")
-        self.search_entry.bind('<KeyRelease>', self.filter_tree)
+            ttk.Label(self.left_frame, text="Search Results:").grid(row=2, column=0, pady=2, sticky="ew")
+            self.search_entry = ttk.Entry(self.left_frame, width=50)
+            self.search_entry.grid(row=3, column=0, pady=2, sticky="ew")
+            self.search_entry.bind('<KeyRelease>', self.filter_tree)
 
-        self.favorites = self.load_favorites()
-        ttk.Label(self.left_frame, text="Favorite Lists:").grid(row=4, column=0, pady=2, sticky="ew")
-        self.favorite_var = tk.StringVar(value="Select Favorite")
-        self.favorite_menu = ttk.Combobox(self.left_frame, textvariable=self.favorite_var, values=list(self.favorites.keys()))
-        self.favorite_menu.grid(row=5, column=0, pady=2, sticky="ew")
+            self.favorites = self.load_favorites()
+            ttk.Label(self.left_frame, text="Favorite Lists:").grid(row=4, column=0, pady=2, sticky="ew")
+            self.favorite_var = tk.StringVar(value="Select Favorite")
+            self.favorite_menu = ttk.Combobox(self.left_frame, textvariable=self.favorite_var, values=list(self.favorites.keys()))
+            self.favorite_menu.grid(row=5, column=0, pady=2, sticky="ew")
 
-        def load_favorite(event=None):
-            selected = self.favorite_var.get()
-            if selected and selected != "Select Favorite":
-                self.entry.delete(0, tk.END)
-                tickers = self.favorites[selected]
-                self.entry.insert(0, ",".join(tickers))
+            def load_favorite(event=None):
+                selected = self.favorite_var.get()
+                if selected and selected != "Select Favorite":
+                    self.entry.delete(0, tk.END)
+                    tickers = self.favorites[selected]
+                    self.entry.insert(0, ",".join(tickers))
 
-        self.favorite_menu.bind('<<ComboboxSelected>>', load_favorite)
+            self.favorite_menu.bind('<<ComboboxSelected>>', load_favorite)
 
-        def save_favorite():
-            print("Save Favorite button clicked")  # Debug
-            self.task_queue.put(self.ticker_manager.initialize())
-            time.sleep(1)  # Wait for initialization (adjust if needed)
-            print(f"NYSE tickers: {len(self.ticker_manager.nyse_tickers)}, NASDAQ tickers: {len(self.ticker_manager.nasdaq_tickers)}")  # Debug
-            tickers_input = self.entry.get()
-            print(f"Input: {tickers_input}")  # Debug
-            if not self.validate_tickers():
-                messagebox.showwarning("Invalid Tickers", "No valid tickers entered.")
-                return
-            name = simpledialog.askstring("Save Favorite", "Enter list name:")
-            print(f"List name: {name}")  # Debug
-            if not name or not name.strip():
-                messagebox.showwarning("Invalid Name", "Please enter a valid list name.")
-                return
-            if name and tickers_input.strip():
-                tickers = self.parse_tickers(tickers_input)
-                print(f"Parsed tickers: {tickers}")  # Debug
-                valid_tickers = [t for t in tickers if self.ticker_manager.is_valid_ticker(t)]
-                print(f"Valid tickers: {valid_tickers}")  # Debug
-                if not valid_tickers:
-                    messagebox.showwarning("Invalid Tickers", "No valid NYSE or NASDAQ tickers.")
-                    return
-                self.favorites[name] = valid_tickers
-                self.save_favorites()
-                self.refresh_favorites_dropdown(name)
-                print(f"Saved favorites: {self.favorites}")  # Debug
+            def save_favorite():
+                try:
+                    analyze_logger.info("Save Favorite button clicked")
+                    self.task_queue.put(self.ticker_manager.initialize())
+                    time.sleep(1)  # Wait for initialization
+                    tickers_input = self.entry.get()
+                    if not self.validate_tickers():
+                        messagebox.showwarning("Invalid Tickers", "No valid tickers entered.")
+                        return
+                    name = simpledialog.askstring("Save Favorite", "Enter list name:")
+                    if not name or not name.strip():
+                        messagebox.showwarning("Invalid Name", "Please enter a valid list name.")
+                        return
+                    if name and tickers_input.strip():
+                        tickers = self.parse_tickers(tickers_input)
+                        valid_tickers = [t for t in tickers if self.ticker_manager.is_valid_ticker(t)]
+                        if not valid_tickers:
+                            messagebox.showwarning("Invalid Tickers", "No valid NYSE or NASDAQ tickers.")
+                            return
+                        self.favorites[name] = valid_tickers
+                        self.save_favorites()
+                        self.refresh_favorites_dropdown(name)
+                except Exception as e:
+                    analyze_logger.error(f"Error in save_favorite: {str(e)}", exc_info=True)
+                    messagebox.showerror("Error", f"Failed to save favorite: {str(e)}")
 
-        ttk.Button(self.left_frame, text="Save Favorite", command=save_favorite).grid(row=6, column=0, pady=2, sticky="ew")
-        ttk.Button(self.left_frame, text="Manage Favorites", command=self.manage_favorites).grid(row=7, column=0, pady=2, sticky="ew")
+            ttk.Button(self.left_frame, text="Save Favorite", command=save_favorite).grid(row=6, column=0, pady=2, sticky="ew")
+            ttk.Button(self.left_frame, text="Manage Favorites", command=self.manage_favorites).grid(row=7, column=0, pady=2, sticky="ew")
 
-        # Margin of Safety
-        self.margin_of_safety_label = ttk.Label(self.left_frame, text="Margin of Safety: 33%")
-        self.margin_of_safety_label.grid(row=8, column=0, pady=2, sticky="ew")
-        ttk.Scale(self.left_frame, from_=0, to=50, orient=tk.HORIZONTAL, variable=self.margin_of_safety_var,
-                  command=lambda value: self.margin_of_safety_label.config(text=f"Margin of Safety: {int(float(value))}%")).grid(row=9, column=0, pady=2, sticky="ew")
+            # Margin of Safety
+            self.margin_of_safety_label = ttk.Label(self.left_frame, text="Margin of Safety: 33%")
+            self.margin_of_safety_label.grid(row=8, column=0, pady=2, sticky="ew")
+            ttk.Scale(self.left_frame, from_=0, to=50, orient=tk.HORIZONTAL, variable=self.margin_of_safety_var,
+                      command=lambda value: self.margin_of_safety_label.config(text=f"Margin of Safety: {int(float(value))}%")).grid(row=9, column=0, pady=2, sticky="ew")
 
-        # Expected Rate of Return
-        self.expected_return_label = ttk.Label(self.left_frame, text="Expected Rate of Return: 0%")
-        self.expected_return_label.grid(row=10, column=0, pady=2, sticky="ew")
-        ttk.Scale(self.left_frame, from_=0, to=20, orient=tk.HORIZONTAL, variable=self.expected_return_var,
-                  command=lambda value: self.expected_return_label.config(text=f"Expected Rate of Return: {int(float(value))}%")).grid(row=11, column=0, pady=2, sticky="ew")
+            # Expected Rate of Return
+            self.expected_return_label = ttk.Label(self.left_frame, text="Expected Rate of Return: 0%")
+            self.expected_return_label.grid(row=10, column=0, pady=2, sticky="ew")
+            ttk.Scale(self.left_frame, from_=0, to=20, orient=tk.HORIZONTAL, variable=self.expected_return_var,
+                      command=lambda value: self.expected_return_label.config(text=f"Expected Rate of Return: {int(float(value))}%")).grid(row=11, column=0, pady=2, sticky="ew")
 
-        self.analyze_button = ttk.Button(self.left_frame, text="Analyze Stocks", command=self.analyze_multiple_stocks)
-        self.analyze_button.grid(row=14, column=0, pady=2, sticky="ew")
+            self.analyze_button = ttk.Button(self.left_frame, text="Analyze Stocks", command=self.analyze_multiple_stocks)
+            self.analyze_button.grid(row=14, column=0, pady=2, sticky="ew")
 
-        # Middle Frame Widgets (Utility Buttons and Progress/Status)
-        ttk.Button(self.middle_frame, text="Check Ticker File Ages", command=self.check_file_age).grid(row=0, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Update Ticker Files", command=self.update_ticker_files).grid(row=1, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Clear Cache", command=self.clear_cache).grid(row=2, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Help", command=self.show_help).grid(row=3, column=0, pady=2, sticky="ew")
-        ttk.Button(self.middle_frame, text="Cancel Screening", command=self.cancel_screening).grid(row=4, column=0, pady=2, sticky="ew")
+            # Middle Frame Widgets (Utility Buttons and Progress/Status)
+            ttk.Button(self.middle_frame, text="Check Ticker File Ages", command=self.check_file_age).grid(row=0, column=0, pady=2, sticky="ew")
+            ttk.Button(self.middle_frame, text="Update Ticker Files", command=self.update_ticker_files).grid(row=1, column=0, pady=2, sticky="ew")
+            ttk.Button(self.middle_frame, text="Clear Cache", command=self.clear_cache).grid(row=2, column=0, pady=2, sticky="ew")
+            ttk.Button(self.middle_frame, text="Help", command=self.show_help).grid(row=3, column=0, pady=2, sticky="ew")
+            ttk.Button(self.middle_frame, text="Cancel Screening", command=self.cancel_screening).grid(row=4, column=0, pady=2, sticky="ew")
 
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(self.middle_frame, variable=self.progress_var, maximum=100, length=300, mode='determinate')
-        self.progress_bar.grid(row=5, column=0, pady=2, sticky="ew")
-        self.progress_label = ttk.Label(self.middle_frame, text="Progress: 0% (0/0 stocks processed, 0 passed)")
-        self.progress_label.grid(row=6, column=0, pady=2, sticky="ew")
+            self.progress_var = tk.DoubleVar()
+            self.progress_bar = ttk.Progressbar(self.middle_frame, variable=self.progress_var, maximum=100, length=300, mode='determinate')
+            self.progress_bar.grid(row=5, column=0, pady=2, sticky="ew")
+            self.progress_label = ttk.Label(self.middle_frame, text="Progress: 0% (0/0 stocks processed, 0 passed)")
+            self.progress_label.grid(row=6, column=0, pady=2, sticky="ew")
 
-        self.cache_var = tk.DoubleVar()
-        self.cache_bar = ttk.Progressbar(self.middle_frame, variable=self.cache_var, maximum=100, length=300, mode='determinate')
-        self.cache_bar.grid(row=7, column=0, pady=2, sticky="ew")
-        self.cache_label = ttk.Label(self.middle_frame, text="Cache Usage: 0% (0 cached, 0 fresh)")
-        self.cache_label.grid(row=8, column=0, pady=2, sticky="ew")
+            self.cache_var = tk.DoubleVar()
+            self.cache_bar = ttk.Progressbar(self.middle_frame, variable=self.cache_var, maximum=100, length=300, mode='determinate')
+            self.cache_bar.grid(row=7, column=0, pady=2, sticky="ew")
+            self.cache_label = ttk.Label(self.middle_frame, text="Cache Usage: 0% (0 cached, 0 fresh)")
+            self.cache_label.grid(row=8, column=0, pady=2, sticky="ew")
 
-        self.rate_limit_label = ttk.Label(self.middle_frame, text="")
-        self.rate_limit_label.grid(row=9, column=0, pady=2, sticky="ew")
-        self.status_label = ttk.Label(self.middle_frame, text="")
-        self.status_label.grid(row=10, column=0, pady=2, sticky="ew")
+            self.rate_limit_label = ttk.Label(self.middle_frame, text="")
+            self.rate_limit_label.grid(row=9, column=0, pady=2, sticky="ew")
+            self.status_label = ttk.Label(self.middle_frame, text="")
+            self.status_label.grid(row=10, column=0, pady=2, sticky="ew")
 
-        # Right Frame Widgets (Screenings)
-        ttk.Checkbutton(self.right_frame, text="Run NYSE Graham Screening", variable=self.nyse_screen_var).grid(row=0, column=0, pady=2, padx=2, sticky="w")
-        ttk.Button(self.right_frame, text="Run NYSE Screening", command=self.run_nyse_screening).grid(row=1, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Show NYSE Qualifying Stocks", command=self.display_nyse_qualifying_stocks).grid(row=2, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Export NYSE Qualifying Stocks", command=self.export_nyse_qualifying_stocks).grid(row=3, column=0, pady=2, sticky="ew")
+            # Right Frame Widgets (Screenings)
+            ttk.Checkbutton(self.right_frame, text="Run NYSE Graham Screening", variable=self.nyse_screen_var).grid(row=0, column=0, pady=2, padx=2, sticky="w")
+            ttk.Button(self.right_frame, text="Run NYSE Screening", command=self.run_nyse_screening).grid(row=1, column=0, pady=2, sticky="ew")
+            ttk.Button(self.right_frame, text="Show NYSE Qualifying Stocks", command=self.display_nyse_qualifying_stocks).grid(row=2, column=0, pady=2, sticky="ew")
+            ttk.Button(self.right_frame, text="Export NYSE Qualifying Stocks", command=self.export_nyse_qualifying_stocks).grid(row=3, column=0, pady=2, sticky="ew")
 
-        ttk.Separator(self.right_frame, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=5)
+            ttk.Separator(self.right_frame, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=5)
 
-        ttk.Checkbutton(self.right_frame, text="Run NASDAQ Graham Screening", variable=self.nasdaq_screen_var).grid(row=5, column=0, pady=2, padx=2, sticky="w")
-        ttk.Button(self.right_frame, text="Run NASDAQ Screening", command=self.run_nasdaq_screening).grid(row=6, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Show NASDAQ Qualifying Stocks", command=self.display_nasdaq_qualifying_stocks).grid(row=7, column=0, pady=2, sticky="ew")
-        ttk.Button(self.right_frame, text="Export NASDAQ Qualifying Stocks", command=self.export_nasdaq_qualifying_stocks).grid(row=8, column=0, pady=2, sticky="ew")
+            ttk.Checkbutton(self.right_frame, text="Run NASDAQ Graham Screening", variable=self.nasdaq_screen_var).grid(row=5, column=0, pady=2, padx=2, sticky="w")
+            ttk.Button(self.right_frame, text="Run NASDAQ Screening", command=self.run_nasdaq_screening).grid(row=6, column=0, pady=2, sticky="ew")
+            ttk.Button(self.right_frame, text="Show NASDAQ Qualifying Stocks", command=self.display_nasdaq_qualifying_stocks).grid(row=7, column=0, pady=2, sticky="ew")
+            ttk.Button(self.right_frame, text="Export NASDAQ Qualifying Stocks", command=self.export_nasdaq_qualifying_stocks).grid(row=8, column=0, pady=2, sticky="ew")
 
-        # Add minimum criteria selector
-        self.min_criteria_var = tk.IntVar(value=6)
-        ttk.Label(self.right_frame, text="Min Graham Criteria:").grid(row=9, column=0, pady=2, sticky="w")
-        self.min_criteria_menu = ttk.Combobox(self.right_frame, textvariable=self.min_criteria_var, values=[4, 5, 6], state="readonly")
-        self.min_criteria_menu.grid(row=10, column=0, pady=2, sticky="ew")
+            # Add minimum criteria selector
+            self.min_criteria_var = tk.IntVar(value=6)
+            ttk.Label(self.right_frame, text="Min Graham Criteria:").grid(row=9, column=0, pady=2, sticky="w")
+            self.min_criteria_menu = ttk.Combobox(self.right_frame, textvariable=self.min_criteria_var, values=[4, 5, 6], state="readonly")
+            self.min_criteria_menu.grid(row=10, column=0, pady=2, sticky="ew")
 
-        # Add sector filter selector below min criteria
-        self.sector_filter_var = tk.StringVar(value="All")
-        ttk.Label(self.right_frame, text="Sector Filter:").grid(row=11, column=0, pady=2, sticky="w")
-        self.sector_menu = ttk.Combobox(
-            self.right_frame, 
-            textvariable=self.sector_filter_var, 
-            values=[
-                "All", "Energy", "Materials", "Industrials", "Consumer Discretionary", 
-                "Consumer Staples", "Health Care", "Financials", "Information Technology", 
-                "Communication Services", "Utilities", "Real Estate", "Unknown"
-            ], 
-            state="readonly"
-        )
-        self.sector_menu.grid(row=12, column=0, pady=2, sticky="ew")
-        ttk.Checkbutton(self.right_frame, text="Screen Financials Separately", variable=self.financial_screen_var).grid(row=13, column=0, pady=2, padx=2, sticky="w")
+            # Add sector filter selector below min criteria
+            self.sector_filter_var = tk.StringVar(value="All")
+            ttk.Label(self.right_frame, text="Sector Filter:").grid(row=11, column=0, pady=2, sticky="w")
+            self.sector_menu = ttk.Combobox(
+                self.right_frame,
+                textvariable=self.sector_filter_var,
+                values=[
+                    "All", "Energy", "Materials", "Industrials", "Consumer Discretionary",
+                    "Consumer Staples", "Health Care", "Financials", "Information Technology",
+                    "Communication Services", "Utilities", "Real Estate", "Unknown"
+                ],
+                state="readonly"
+            )
+            self.sector_menu.grid(row=12, column=0, pady=2, sticky="ew")
+            ttk.Checkbutton(self.right_frame, text="Screen Financials Separately", variable=self.financial_screen_var).grid(row=13, column=0, pady=2, padx=2, sticky="w")
 
-        # Treeview and Tabs
-        self.full_tree_frame = ttk.Frame(self.main_frame)
-        self.full_tree_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
-        self.full_tree_frame.grid_columnconfigure(0, weight=1)
-        self.full_tree_frame.grid_rowconfigure(0, weight=3)
-        self.full_tree_frame.grid_rowconfigure(1, weight=0)
-        self.full_tree_frame.grid_rowconfigure(2, weight=1)
+            # Treeview and Tabs
+            self.full_tree_frame = ttk.Frame(self.main_frame)
+            self.full_tree_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
+            self.full_tree_frame.grid_columnconfigure(0, weight=1)
+            self.full_tree_frame.grid_rowconfigure(0, weight=3)
+            self.full_tree_frame.grid_rowconfigure(1, weight=0)
+            self.full_tree_frame.grid_rowconfigure(2, weight=1)
 
-        self.tree = ttk.Treeview(self.full_tree_frame, columns=(1, 2, 3, 4, 5, 6, 7), show="tree headings", height=10)
-        self.v_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="vertical", command=self.tree.yview)
-        self.h_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.v_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.h_scrollbar.grid(row=1, column=0, sticky="ew")
-        self.tree.configure(yscrollcommand=self.v_scrollbar.set, xscrollcommand=self.h_scrollbar.set)
+            self.tree = ttk.Treeview(self.full_tree_frame, columns=(1, 2, 3, 4, 5, 6, 7), show="tree headings", height=10)
+            self.v_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="vertical", command=self.tree.yview)
+            self.h_scrollbar = ttk.Scrollbar(self.full_tree_frame, orient="horizontal", command=self.tree.xview)
+            self.tree.grid(row=0, column=0, sticky="nsew")
+            self.v_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.h_scrollbar.grid(row=1, column=0, sticky="ew")
+            self.tree.configure(yscrollcommand=self.v_scrollbar.set, xscrollcommand=self.h_scrollbar.set)
 
-        self.tree.heading("#0", text="Ticker")
-        self.tree.heading(1, text="Company Name")
-        self.tree.heading(2, text="Sector")
-        self.tree.heading(3, text="Score")
-        self.tree.heading(4, text="Price ($)")
-        self.tree.heading(5, text="Intrinsic Value ($)")
-        self.tree.heading(6, text="Buy Price ($)")
-        self.tree.heading(7, text="Sell Price ($)")
-        self.tree.column("#0", width=80, anchor="center")
-        self.tree.column(1, width=150, anchor="center")
-        self.tree.column(2, width=80, anchor="center")
-        self.tree.column(3, width=80, anchor="center")
-        self.tree.column(4, width=80, anchor="center")
-        self.tree.column(5, width=100, anchor="center")
-        self.tree.column(6, width=80, anchor="center")
-        self.tree.column(7, width=80, anchor="center")
+            self.tree.heading("#0", text="Ticker")
+            self.tree.heading(1, text="Company Name")
+            self.tree.heading(2, text="Sector")
+            self.tree.heading(3, text="Score")
+            self.tree.heading(4, text="Price ($)")
+            self.tree.heading(5, text="Intrinsic Value ($)")
+            self.tree.heading(6, text="Buy Price ($)")
+            self.tree.heading(7, text="Sell Price ($)")
+            self.tree.column("#0", width=80, anchor="center")
+            self.tree.column(1, width=150, anchor="center")
+            self.tree.column(2, width=80, anchor="center")
+            self.tree.column(3, width=80, anchor="center")
+            self.tree.column(4, width=80, anchor="center")
+            self.tree.column(5, width=100, anchor="center")
+            self.tree.column(6, width=80, anchor="center")
+            self.tree.column(7, width=80, anchor="center")
 
-        self.tree.tag_configure('highlight', background='lightgreen')
+            self.tree.tag_configure('highlight', background='lightgreen')
 
-        for col in self.tree["columns"]:
-            self.tree.heading(col, command=lambda c=col: self.sort_tree(self.tree["columns"].index(c)))
+            for col in self.tree["columns"]:
+                self.tree.heading(col, command=lambda c=col: self.sort_tree(self.tree["columns"].index(c)))
 
-        self.data_frame = ttk.Frame(self.full_tree_frame)
-        self.notebook = ttk.Notebook(self.data_frame)
-        self.historical_frame = ttk.Frame(self.notebook)
-        self.metrics_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.historical_frame, text="Historical Data")
-        self.notebook.add(self.metrics_frame, text="Metrics")
-        self.data_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
-        self.notebook.grid(row=0, column=0, sticky="nsew")
-        self.data_frame.grid_columnconfigure(0, weight=1)
-        self.data_frame.grid_rowconfigure(0, weight=1)
+            self.data_frame = ttk.Frame(self.full_tree_frame)
+            self.notebook = ttk.Notebook(self.data_frame)
+            self.historical_frame = ttk.Frame(self.notebook)
+            self.metrics_frame = ttk.Frame(self.notebook)
+            self.notebook.add(self.historical_frame, text="Historical Data")
+            self.notebook.add(self.metrics_frame, text="Metrics")
+            self.data_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+            self.notebook.grid(row=0, column=0, sticky="nsew")
+            self.data_frame.grid_columnconfigure(0, weight=1)
+            self.data_frame.grid_rowconfigure(0, weight=1)
 
-        self.historical_frame.grid_rowconfigure(0, weight=1)
-        self.historical_frame.grid_columnconfigure(0, weight=1)
-        self.metrics_frame.grid_rowconfigure(0, weight=1)
-        self.metrics_frame.grid_columnconfigure(0, weight=1)
+            self.historical_frame.grid_rowconfigure(0, weight=1)
+            self.historical_frame.grid_columnconfigure(0, weight=1)
+            self.metrics_frame.grid_rowconfigure(0, weight=1)
+            self.metrics_frame.grid_columnconfigure(0, weight=1)
 
-        self.historical_text = scrolledtext.ScrolledText(self.historical_frame, width=70, height=12)
-        self.historical_text.grid(row=0, column=0, sticky="nsew")
-        self.metrics_text = scrolledtext.ScrolledText(self.metrics_frame, width=70, height=12)
-        self.metrics_text.grid(row=0, column=0, sticky="nsew")
+            self.historical_text = scrolledtext.ScrolledText(self.historical_frame, width=70, height=12)
+            self.historical_text.grid(row=0, column=0, sticky="nsew")
+            self.metrics_text = scrolledtext.ScrolledText(self.metrics_frame, width=70, height=12)
+            self.metrics_text.grid(row=0, column=0, sticky="nsew")
 
-        self.tree.bind("<<TreeviewSelect>>", self.update_tabs)
+            self.tree.bind("<<TreeviewSelect>>", self.update_tabs)
+        except Exception as e:
+            analyze_logger.error(f"Error creating widgets: {str(e)}", exc_info=True)
+            messagebox.showerror("Widget Creation Error", f"Failed to create GUI widgets: {str(e)}")
+
+    def create_tooltip(self, widget, text):
+        """Create a tooltip for a Tkinter widget."""
+        tooltip = None
+        def show_tooltip(event):
+            nonlocal tooltip
+            if tooltip:
+                tooltip.destroy()
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)  # Remove window decorations
+            tooltip.geometry(f"+{event.x_root}+{event.y_root+10}")
+            label = tk.Label(tooltip, text=text, background="#ffffe0", relief="solid", borderwidth=1)
+            label.pack()
+
+        def hide_tooltip(event):
+            nonlocal tooltip
+            if tooltip:
+                tooltip.destroy()
+                tooltip = None
+
+        widget.bind("<Enter>", show_tooltip)
+        widget.bind("<Leave>", hide_tooltip)
+
+    def safe_update_tree(self, ticker, values, tags=None):
+        """Thread-safe method to update the Treeview."""
+        self.root.after(0, lambda: self.tree.insert("", "end", text=ticker, values=values, tags=tags))
 
     def validate_tickers(self):
         tickers = self.parse_tickers(self.entry.get())
         valid = all(self.ticker_manager.is_valid_ticker(t) for t in tickers)
         self.entry.config(style="Invalid.TEntry" if not valid else "TEntry")
-        # In __init__, add: style.configure("Invalid.TEntry", fieldbackground="pink")
         return valid
 
     def parse_tickers(self, tickers_input):
@@ -388,7 +443,9 @@ class GrahamScreeningApp:
         else:
             eta_text = f", ETA: {str(timedelta(seconds=int(eta)))[:-3]}" if eta is not None else ""
             self.progress_label.config(text=f"Progress: {progress:.1f}% (Screening, {passed_tickers} passed{eta_text})")
-        self.root.update_idletasks()
+        self.root.update_idletasks()  # Process pending events
+        self.root.update()  # Force full GUI redraw
+        analyze_logger.debug(f"Progress callback executed: {progress:.1f}% ({processed}/{total_tickers if tickers else 0} processed, {passed_tickers} passed, ETA {eta if eta else 0}s)")
 
     def update_cache_usage(self, cache_hits, total):
         if total > 0:
@@ -417,8 +474,7 @@ class GrahamScreeningApp:
             self.cancel_event.set()
             self.status_label.config(text="Cancelling screening...")
 
-    # Screening Logic
-    def run_screening(self, exchange: str, screen_func) -> None:
+    def run_screening(self, exchange: str, screen_func):
         if self.screening_active:
             messagebox.showwarning("Warning", f"A {exchange} screening is already in progress.")
             return
@@ -461,14 +517,14 @@ class GrahamScreeningApp:
         self.screening_active = True
 
         min_criteria = self.min_criteria_var.get()
-        sector_filter = self.sector_filter_var.get() if self.sector_filter_var.get() != "All" else None  # New: Get sector
-        separate_financials = self.financial_screen_var.get()  # Added: Pass checkbox value
+        sector_filter = self.sector_filter_var.get() if self.sector_filter_var.get() != "All" else None
+        separate_financials = self.financial_screen_var.get()
 
         async def screening_task():
             try:
                 await self.ticker_manager.initialize()
-                qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks = await screen_func(  # Updated return unpacking
-                    exchange=exchange,  # New param
+                qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks = await screen_func(
+                    exchange=exchange,
                     batch_size=50,
                     cancel_event=self.cancel_event,
                     root=self.root,
@@ -477,9 +533,10 @@ class GrahamScreeningApp:
                     ticker_manager=self.ticker_manager,
                     update_rate_limit=self.update_rate_limit,
                     min_criteria=min_criteria,
-                    sector_filter=sector_filter,  # New: Pass sector
-                    separate_financials=separate_financials  # Added
+                    sector_filter=sector_filter,
+                    separate_financials=separate_financials
                 )
+                await asyncio.sleep(0)  # Yield to allow Tkinter event processing
                 screening_logger.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
                 if not self.cancel_event.is_set():
                     if qualifying_stocks:
@@ -524,13 +581,12 @@ class GrahamScreeningApp:
 
         self.task_queue.put(screening_task())
 
-    def run_nyse_screening(self) -> None:
-        self.run_screening("NYSE", screen_exchange_graham_stocks)  # Updated to use refactored func
+    def run_nyse_screening(self):
+        self.run_screening("NYSE", screen_exchange_graham_stocks)
 
-    def run_nasdaq_screening(self) -> None:
-        self.run_screening("NASDAQ", screen_exchange_graham_stocks)  # Updated to use refactored func
+    def run_nasdaq_screening(self):
+        self.run_screening("NASDAQ", screen_exchange_graham_stocks)
 
-    # Data Fetching and Analysis
     async def fetch_company_name(self, ticker):
         try:
             stock = yf.Ticker(ticker)
@@ -548,94 +604,99 @@ class GrahamScreeningApp:
         nyse_file_hash = get_file_hash(NYSE_LIST_FILE)
         nasdaq_file_hash = get_file_hash(NASDAQ_LIST_FILE)
 
-        conn, cursor = get_stocks_connection()
-        try:
-            cursor.execute("SELECT file_hash, exchange, timestamp FROM screening_progress WHERE ticker=?", (ticker,))
-            row = cursor.fetchone()
-            if row:
-                columns = [desc[0] for desc in cursor.description]
-                progress_dict = dict(zip(columns, row))
-                stored_hash = progress_dict['file_hash']
-                stored_exchange = progress_dict['exchange']
-                timestamp_str = progress_dict['timestamp']
-                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').timestamp() if timestamp_str else 0
-                if ((stored_exchange == "NYSE" and stored_hash == nyse_file_hash) or 
-                    (stored_exchange == "NASDAQ" and stored_hash == nasdaq_file_hash)) and \
-                (time.time() - timestamp < CACHE_EXPIRY):
-                    cursor.execute("SELECT * FROM stocks WHERE ticker=?", (ticker,))
-                    stock_row = cursor.fetchone()
-                    if stock_row:
-                        columns = [desc[0] for desc in cursor.description]
-                        stock_dict = dict(zip(columns, stock_row))
-                        analyze_logger.info(f"Database cache hit for {ticker}")
-                        stock = yf.Ticker(ticker)
-                        info = stock.info
-                        price = info.get('regularMarketPrice', info.get('previousClose', None))
-                        if price is None:
-                            analyze_logger.error(f"No price data for {ticker} from YFinance")
-                            return None
-                        roe_list = [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else []
-                        rotc_list = [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else []
-                        eps_list = [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else []
-                        div_list = [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else []
-                        balance_data = json.loads(stock_dict['balance_data']) if stock_dict['balance_data'] else []
-                        years = [int(y) for y in stock_dict['years'].split(",")] if stock_dict.get('years') else []
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                conn, cursor = get_stocks_connection()
+                cursor.execute("SELECT file_hash, exchange, timestamp FROM screening_progress WHERE ticker=?", (ticker,))
+                row = cursor.fetchone()
+                if row:
+                    columns = [desc[0] for desc in cursor.description]
+                    progress_dict = dict(zip(columns, row))
+                    stored_hash = progress_dict['file_hash']
+                    stored_exchange = progress_dict['exchange']
+                    timestamp_str = progress_dict['timestamp']
+                    timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').timestamp() if timestamp_str else 0
+                    if ((stored_exchange == "NYSE" and stored_hash == nyse_file_hash) or
+                        (stored_exchange == "NASDAQ" and stored_hash == nasdaq_file_hash)) and \
+                       (time.time() - timestamp < CACHE_EXPIRY):
+                        cursor.execute("SELECT * FROM stocks WHERE ticker=?", (ticker,))
+                        stock_row = cursor.fetchone()
+                        if stock_row:
+                            columns = [desc[0] for desc in cursor.description]
+                            stock_dict = dict(zip(columns, stock_row))
+                            analyze_logger.info(f"Database cache hit for {ticker}")
+                            stock = yf.Ticker(ticker)
+                            info = stock.info
+                            price = info.get('regularMarketPrice', info.get('previousClose', None))
+                            if price is None:
+                                analyze_logger.error(f"No price data for {ticker} from YFinance")
+                                return None
+                            roe_list = [float(x) if x.strip() else 0.0 for x in stock_dict['roe'].split(",")] if stock_dict['roe'] else []
+                            rotc_list = [float(x) if x.strip() else 0.0 for x in stock_dict['rotc'].split(",")] if stock_dict['rotc'] else []
+                            eps_list = [float(x) if x.strip() else 0.0 for x in stock_dict['eps'].split(",")] if stock_dict['eps'] else []
+                            div_list = [float(x) if x.strip() else 0.0 for x in stock_dict['dividend'].split(",")] if stock_dict['dividend'] else []
+                            balance_data = json.loads(stock_dict['balance_data']) if stock_dict['balance_data'] else []
+                            years = [int(y) for y in stock_dict['years'].split(",")] if stock_dict.get('years') else []
 
-                        company_name = stock_dict['company_name']
-                        debt_to_equity = stock_dict['debt_to_equity']
-                        eps_ttm = stock_dict['eps_ttm']
-                        book_value_per_share = stock_dict['book_value_per_share']
-                        sector = stock_dict.get('sector', 'Unknown')
+                            company_name = stock_dict['company_name']
+                            debt_to_equity = stock_dict['debt_to_equity']
+                            eps_ttm = stock_dict['eps_ttm']
+                            book_value_per_share = stock_dict['book_value_per_share']
+                            sector = stock_dict.get('sector', 'Unknown')
 
-                        cached_stock_data = {
-                            "ticker": stock_dict['ticker'],
-                            "sector": sector,
-                            "eps_ttm": eps_ttm,
-                            "eps_list": eps_list,
-                            "eps_cagr": stock_dict.get('eps_cagr', 0.0)
-                        }
-                        intrinsic_value = await calculate_graham_value(eps_ttm, cached_stock_data) if eps_ttm is not None and eps_ttm > 0 else float('nan')
-                        margin_of_safety = self.margin_of_safety_var.get() / 100
-                        expected_return = self.expected_return_var.get() / 100
-                        buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
-                        sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
-                        latest_revenue = stock_dict['latest_revenue']
-                        key_metrics_data = json.loads(stock_dict.get('key_metrics_data', '[]'))
-                        graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data, key_metrics_data, stock_dict['available_data_years'], latest_revenue, sector)
+                            cached_stock_data = {
+                                "ticker": stock_dict['ticker'],
+                                "sector": sector,
+                                "eps_ttm": eps_ttm,
+                                "eps_list": eps_list,
+                                "eps_cagr": stock_dict.get('eps_cagr', 0.0)
+                            }
+                            intrinsic_value = await calculate_graham_value(eps_ttm, cached_stock_data) if eps_ttm is not None and eps_ttm > 0 else float('nan')
+                            margin_of_safety = self.margin_of_safety_var.get() / 100
+                            expected_return = self.expected_return_var.get() / 100
+                            buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
+                            sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
+                            latest_revenue = stock_dict['latest_revenue']
+                            key_metrics_data = json.loads(stock_dict.get('key_metrics_data', '[]'))
+                            graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data, key_metrics_data, stock_dict['available_data_years'], latest_revenue, sector)
 
-                        result = {
-                            "ticker": stock_dict['ticker'],
-                            "sector": sector,
-                            "company_name": company_name,
-                            "price": price,
-                            "intrinsic_value": intrinsic_value,
-                            "buy_price": buy_price,
-                            "sell_price": sell_price,
-                            "graham_score": graham_score,
-                            "years": years,
-                            "roe_list": roe_list,
-                            "rotc_list": rotc_list,
-                            "eps_list": eps_list,
-                            "div_list": div_list,
-                            "balance_data": balance_data,
-                            "latest_revenue": latest_revenue,
-                            "available_data_years": stock_dict['available_data_years'],
-                            "eps_ttm": eps_ttm,
-                            "book_value_per_share": book_value_per_share,
-                            "debt_to_equity": debt_to_equity,
-                            "eps_cagr": stock_dict.get('eps_cagr', 0.0)
-                        }
-                        with self.ticker_cache_lock:
-                            self.ticker_cache[ticker] = result
-                        analyze_logger.debug(f"Cached data retrieved for {ticker}: Score={graham_score}/8 with {stock_dict['available_data_years']} years")
-                        return result
-            analyze_logger.info(f"Cache miss for {ticker}: Data stale or missing")
-            return None
-        except sqlite3.Error as e:
-            analyze_logger.error(f"Database error in fetch_cached_data for {ticker}: {str(e)}")
-            return None
-        finally:
-            conn.close()
+                            result = {
+                                "ticker": stock_dict['ticker'],
+                                "sector": sector,
+                                "company_name": company_name,
+                                "price": price,
+                                "intrinsic_value": intrinsic_value,
+                                "buy_price": buy_price,
+                                "sell_price": sell_price,
+                                "graham_score": graham_score,
+                                "years": years,
+                                "roe_list": roe_list,
+                                "rotc_list": rotc_list,
+                                "eps_list": eps_list,
+                                "div_list": div_list,
+                                "balance_data": balance_data,
+                                "latest_revenue": latest_revenue,
+                                "available_data_years": stock_dict['available_data_years'],
+                                "eps_ttm": eps_ttm,
+                                "book_value_per_share": book_value_per_share,
+                                "debt_to_equity": debt_to_equity,
+                                "eps_cagr": stock_dict.get('eps_cagr', 0.0)
+                            }
+                            with self.ticker_cache_lock:
+                                self.ticker_cache[ticker] = result
+                            analyze_logger.debug(f"Cached data retrieved for {ticker}: Score={graham_score}/8 with {stock_dict['available_data_years']} years")
+                            return result
+                analyze_logger.info(f"Cache miss for {ticker}: Data stale or missing")
+                return None
+            except sqlite3.Error as e:
+                analyze_logger.error(f"Database error in fetch_cached_data for {ticker} (attempt {attempt + 1}/3): {str(e)}")
+                if attempt < 2:
+                    time.sleep(1)  # Wait before retry
+                    continue
+                return None
+            finally:
+                conn.close()
+        return None
 
     async def determine_exchange(self, ticker):
         await self.ticker_manager.initialize()
@@ -692,14 +753,23 @@ class GrahamScreeningApp:
         self.root.update()
 
         analyze_logger.info(f"Fetching data for {len(tickers)} tickers with margin_of_safety={self.margin_of_safety_var.get()/100}, expected_return={self.expected_return_var.get()/100}")
-        results, error_tickers, cache_hits = await fetch_batch_data(
-            tickers,
-            screening_mode=False,
-            expected_return=self.expected_return_var.get() / 100,
-            margin_of_safety=self.margin_of_safety_var.get() / 100,
-            ticker_manager=self.ticker_manager,
-            update_rate_limit=self.update_rate_limit
-        )
+        try:
+            results, error_tickers, cache_hits = await fetch_batch_data(
+                tickers,
+                screening_mode=False,
+                expected_return=self.expected_return_var.get() / 100,
+                margin_of_safety=self.margin_of_safety_var.get() / 100,
+                ticker_manager=self.ticker_manager,
+                update_rate_limit=self.update_rate_limit
+            )
+        except aiohttp.ClientError as e:
+            analyze_logger.error(f"Network error during analysis: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("Network Error", "Failed to fetch data due to network issues."))
+            return
+        except ValueError as e:
+            analyze_logger.error(f"Data error during analysis: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("Data Error", str(e)))
+            return
 
         valid_results = [r for r in results if 'error' not in r]
         passed_tickers = sum(1 for r in valid_results if r.get('graham_score', 0) >= 5 and r.get('available_data_years', 0) >= 10)
@@ -724,16 +794,20 @@ class GrahamScreeningApp:
 
             price = result['price']
             buy_price = result['buy_price']
-            tags = ('highlight',) if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price) else ()
-            self.tree.insert("", "end", text=result['ticker'], values=(
-                result['company_name'],
-                result['sector'],
-                f"{result['graham_score']}/8{warning}",
-                f"${self.format_float(result['price'])}",
-                f"${self.format_float(result['intrinsic_value'])}",
-                f"${self.format_float(result['buy_price'])}",
-                f"${self.format_float(result['sell_price'])}"
-            ), tags=tags)
+            tags = ('highlight',) if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price) else ''
+            self.safe_update_tree(
+                result['ticker'],
+                (
+                    result['company_name'],
+                    result['sector'],
+                    f"{result['graham_score']}/8{warning}",
+                    f"${self.format_float(result['price'])}",
+                    f"${self.format_float(result['intrinsic_value'])}",
+                    f"${self.format_float(result['buy_price'])}",
+                    f"${self.format_float(result['sell_price'])}"
+                ),
+                tags
+            )
 
             # Cache the result in ticker_cache
             with self.ticker_cache_lock:
@@ -785,11 +859,11 @@ class GrahamScreeningApp:
                 continue
 
             result = await fetch_batch_data(
-                [ticker], 
-                screening_mode=False, 
+                [ticker],
+                screening_mode=False,
                 expected_return=self.expected_return_var.get() / 100,
                 margin_of_safety=self.margin_of_safety_var.get() / 100,
-                exchange=source, 
+                exchange=source,
                 ticker_manager=self.ticker_manager,
                 update_rate_limit=self.update_rate_limit
             )
@@ -819,15 +893,19 @@ class GrahamScreeningApp:
             price = result.get('price', 0)
             buy_price = result.get('buy_price', float('nan'))
             tags = ('highlight',) if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price) else ()
-            self.tree.insert("", "end", text=ticker, values=(
-                company_name,
-                exchange,
-                f"{common_score}/6",
-                f"${self.format_float(result.get('price', 0))}",
-                f"${self.format_float(result.get('intrinsic_value', float('nan')))}",
-                f"${self.format_float(result.get('buy_price', float('nan')))}",
-                f"${self.format_float(result.get('sell_price', float('nan')))}"
-            ), tags=tags)
+            self.safe_update_tree(
+                ticker,
+                (
+                    company_name,
+                    exchange,
+                    f"{common_score}/6",
+                    f"${self.format_float(result.get('price', 0))}",
+                    f"${self.format_float(result.get('intrinsic_value', float('nan')))}",
+                    f"${self.format_float(result.get('buy_price', float('nan')))}",
+                    f"${self.format_float(result.get('sell_price', float('nan')))}"
+                ),
+                tags
+            )
 
         self.sort_tree(0)
 
@@ -993,17 +1071,29 @@ class GrahamScreeningApp:
                 self.tree.delete(item)
 
             if not results:
-                self.tree.insert("", "end", text="No qualifying stocks found",
-                                values=("", "", "", "", "", "", ""))
+                self.safe_update_tree(
+                    "No qualifying stocks found",
+                    ("", "", "", "", "", "", "")
+                )
                 analyze_logger.info(f"No NYSE qualifiers found for min_criteria={self.min_criteria_var.get()}")
                 return
 
             # Populate treeview
             for ticker, company_name, sector, common_score in results:
                 display_name = company_name if company_name else ticker
-                self.tree.insert("", "end", text=ticker, values=(
-                    display_name, sector, f"{common_score}/6", "", "", "", ""
-                ), tags=('financial',) if sector == 'Financials' else ())
+                self.safe_update_tree(
+                    ticker,
+                    (
+                        display_name,
+                        sector,
+                        f"{common_score}/6",
+                        "",
+                        "",
+                        "",
+                        ""
+                    ),
+                    tags=('financial',) if sector == 'Financials' else ()
+                )
                 analyze_logger.debug(f"Displayed NYSE {ticker}: {display_name} (Sector: {sector}, Score: {common_score}/6)")
 
             self.tree.tag_configure('financial', foreground='blue')  # Visual distinction for financials
@@ -1034,17 +1124,29 @@ class GrahamScreeningApp:
                 self.tree.delete(item)
 
             if not results:
-                self.tree.insert("", "end", text="No qualifying stocks found",
-                                values=("", "", "", "", "", "", ""))
+                self.safe_update_tree(
+                    "No qualifying stocks found",
+                    ("", "", "", "", "", "", "")
+                )
                 analyze_logger.info(f"No NASDAQ qualifiers found for min_criteria={self.min_criteria_var.get()}")
                 return
 
             # Populate treeview
             for ticker, company_name, sector, common_score in results:
                 display_name = company_name if company_name else ticker
-                self.tree.insert("", "end", text=ticker, values=(
-                    display_name, sector, f"{common_score}/6", "", "", "", ""
-                ), tags=('financial',) if sector == 'Financials' else ())
+                self.safe_update_tree(
+                    ticker,
+                    (
+                        display_name,
+                        sector,
+                        f"{common_score}/6",
+                        "",
+                        "",
+                        "",
+                        ""
+                    ),
+                    tags=('financial',) if sector == 'Financials' else ()
+                )
                 analyze_logger.debug(f"Displayed NASDAQ {ticker}: {display_name} (Sector: {sector}, Score: {common_score}/6)")
 
             self.tree.tag_configure('financial', foreground='blue')  # Visual distinction for financials

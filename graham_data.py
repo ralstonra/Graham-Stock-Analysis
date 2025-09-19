@@ -17,11 +17,12 @@ import random
 from decouple import config
 from ftplib import FTP
 from config import (
-    FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, 
-    NYSE_LIST_FILE, NASDAQ_LIST_FILE, USER_DATA_DIR, FRED_API_KEY, FAVORITES_LOCK, 
-    FileHashError, FAVORITES_FILE, CACHE_EXPIRY, MAX_CALLS_PER_MINUTE_PAID, 
-    screening_logger, analyze_logger
+    FMP_API_KEYS, FRED_API_KEY, CACHE_DB, NYSE_LIST_FILE, NASDAQ_LIST_FILE, 
+    USER_DATA_DIR, FAVORITES_LOCK, FAVORITES_FILE, CACHE_EXPIRY, 
+    MAX_CALLS_PER_MINUTE_PAID, screening_logger, analyze_logger, 
+    get_file_hash, FileHashError, USE_FREE_API_KEY  # Added USE_FREE_API_KEY
 )
+from graham_utils import paid_rate_limiter, free_rate_limiter
 
 # Constants for batch processing and concurrency control
 MAX_CONCURRENT_TICKERS = 10
@@ -98,131 +99,131 @@ def get_aaa_yield(api_key: str, default_yield: float = 0.045) -> float:
 schema_initialized = False
 schema_lock = threading.Lock()
 
-def get_stocks_connection():
-    """Establish a connection to the SQLite database with increased timeout."""
+def get_stocks_connection(max_retries=3, retry_delay=1):
+    """Establish a connection to the SQLite database with retry logic and increased timeout."""
     global schema_initialized
-    try:
-        conn = sqlite3.connect(CACHE_DB, timeout=60)
-        cursor = conn.cursor()
-        
-        # Check if schema needs to be initialized
-        with schema_lock:
-            if not schema_initialized:
-                # Create or update the 'stocks' table with new raw data columns
-                cursor.execute('''CREATE TABLE IF NOT EXISTS stocks (
-                    ticker TEXT PRIMARY KEY,
-                    date TEXT,
-                    roe TEXT,
-                    rotc TEXT,
-                    eps TEXT,
-                    dividend TEXT,
-                    ticker_list_hash TEXT,
-                    balance_data TEXT,
-                    cash_flow_data TEXT,
-                    key_metrics_data TEXT,
-                    timestamp REAL,
-                    company_name TEXT,
-                    debt_to_equity REAL,
-                    eps_ttm REAL,
-                    book_value_per_share REAL,
-                    common_score INTEGER,
-                    latest_revenue REAL,
-                    available_data_years INTEGER,
-                    sector TEXT,
-                    years TEXT,
-                    latest_total_assets REAL,
-                    latest_total_liabilities REAL,
-                    latest_shares_outstanding REAL,
-                    latest_long_term_debt REAL,
-                    latest_short_term_debt REAL,
-                    latest_current_assets REAL,
-                    latest_current_liabilities REAL,
-                    latest_book_value REAL,
-                    historic_pe_ratios TEXT,
-                    latest_net_income REAL,
-                    eps_cagr REAL,
-                    latest_free_cash_flow REAL,
-                    raw_income_data TEXT,
-                    raw_balance_data TEXT,
-                    raw_dividend_data TEXT,
-                    raw_profile_data TEXT,
-                    raw_cash_flow_data TEXT,
-                    raw_key_metrics_data TEXT,
-                    exchange TEXT
-                )''')
-                cursor.execute("PRAGMA table_info(stocks)")
-                columns = [col[1] for col in cursor.fetchall()]
-                new_columns = [
-                    'latest_total_assets REAL',
-                    'latest_total_liabilities REAL',
-                    'latest_shares_outstanding REAL',
-                    'latest_long_term_debt REAL',
-                    'latest_short_term_debt REAL',
-                    'latest_current_assets REAL',
-                    'latest_current_liabilities REAL',
-                    'latest_book_value REAL',
-                    'historic_pe_ratios TEXT',
-                    'latest_net_income REAL',
-                    'eps_cagr REAL',
-                    'latest_free_cash_flow REAL',
-                    'raw_income_data TEXT',
-                    'raw_balance_data TEXT',
-                    'raw_dividend_data TEXT',
-                    'raw_profile_data TEXT',
-                    'raw_cash_flow_data TEXT',
-                    'raw_key_metrics_data TEXT',
-                    'exchange'
-                ]
-                for col in new_columns:
-                    col_name = col.split()[0]
-                    if col_name not in columns:
-                        cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
-                        analyze_logger.info(f"Added '{col_name}' column to stocks table")
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(CACHE_DB, timeout=60)
+            cursor = conn.cursor()
+            
+            # Check if schema needs to be initialized
+            with schema_lock:
+                if not schema_initialized:
+                    # Create or update the 'stocks' table with new raw data columns
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS stocks (
+                        ticker TEXT PRIMARY KEY,
+                        date TEXT,
+                        roe TEXT,
+                        rotc TEXT,
+                        eps TEXT,
+                        dividend TEXT,
+                        ticker_list_hash TEXT,
+                        balance_data TEXT,
+                        cash_flow_data TEXT,
+                        key_metrics_data TEXT,
+                        timestamp REAL,
+                        company_name TEXT,
+                        debt_to_equity REAL,
+                        eps_ttm REAL,
+                        book_value_per_share REAL,
+                        common_score INTEGER,
+                        latest_revenue REAL,
+                        available_data_years INTEGER,
+                        sector TEXT,
+                        years TEXT,
+                        latest_total_assets REAL,
+                        latest_total_liabilities REAL,
+                        latest_shares_outstanding REAL,
+                        latest_long_term_debt REAL,
+                        latest_short_term_debt REAL,
+                        latest_current_assets REAL,
+                        latest_current_liabilities REAL,
+                        latest_book_value REAL,
+                        historic_pe_ratios TEXT,
+                        latest_net_income REAL,
+                        eps_cagr REAL,
+                        latest_free_cash_flow REAL,
+                        raw_income_data TEXT,
+                        raw_balance_data TEXT,
+                        raw_dividend_data TEXT,
+                        raw_profile_data TEXT,
+                        raw_cash_flow_data TEXT,
+                        raw_key_metrics_data TEXT,
+                        exchange TEXT
+                    )''')
+                    cursor.execute("PRAGMA table_info(stocks)")
+                    columns = [col[1] for col in cursor.fetchall()]
+                    new_columns = [
+                        'latest_total_assets REAL',
+                        'latest_total_liabilities REAL',
+                        'latest_shares_outstanding REAL',
+                        'latest_long_term_debt REAL',
+                        'latest_short_term_debt REAL',
+                        'latest_current_assets REAL',
+                        'latest_current_liabilities REAL',
+                        'latest_book_value REAL',
+                        'historic_pe_ratios TEXT',
+                        'latest_net_income REAL',
+                        'eps_cagr REAL',
+                        'latest_free_cash_flow REAL',
+                        'raw_income_data TEXT',
+                        'raw_balance_data TEXT',
+                        'raw_dividend_data TEXT',
+                        'raw_profile_data TEXT',
+                        'raw_cash_flow_data TEXT',
+                        'raw_key_metrics_data TEXT',
+                        'exchange'
+                    ]
+                    for col in new_columns:
+                        col_name = col.split()[0]
+                        if col_name not in columns:
+                            cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
+                            analyze_logger.info(f"Added '{col_name}' column to stocks table")
 
-                # Create or update the 'graham_qualifiers' table
-                cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
-                    ticker TEXT PRIMARY KEY,
-                    common_score INTEGER,
-                    date TEXT,
-                    sector TEXT,
-                    exchange TEXT,
-                    min_criteria INTEGER
-                )''')
-                                
-                # Create the 'screening_progress' table if it doesn't exist
-                cursor.execute('''CREATE TABLE IF NOT EXISTS screening_progress (
-                    exchange TEXT,
-                    ticker TEXT,
-                    timestamp TEXT,
-                    file_hash TEXT,
-                    status TEXT,
-                    PRIMARY KEY (exchange, ticker)
-                )''')
-                
-                conn.commit()
-                schema_initialized = True
-                analyze_logger.info("Database schema initialized successfully.")
-        
-        return conn, cursor
-    except sqlite3.Error as e:
-        analyze_logger.error(f"Failed to initialize database connection: {str(e)}")
-        raise
+                    # Create or update the 'graham_qualifiers' table
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
+                        ticker TEXT PRIMARY KEY,
+                        common_score INTEGER,
+                        date TEXT,
+                        sector TEXT,
+                        exchange TEXT,
+                        min_criteria INTEGER
+                    )''')
+                                    
+                    # Create the 'screening_progress' table if it doesn't exist
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS screening_progress (
+                        exchange TEXT,
+                        ticker TEXT,
+                        timestamp TEXT,
+                        file_hash TEXT,
+                        status TEXT,
+                        PRIMARY KEY (exchange, ticker)
+                    )''')
+                    
+                    conn.commit()
+                    schema_initialized = True
+                    analyze_logger.info("Database schema initialized successfully.")
+            
+            return conn, cursor
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                analyze_logger.warning(f"Database locked, retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                analyze_logger.error(f"Failed to initialize database connection: {str(e)}")
+                raise
+        except sqlite3.Error as e:
+            analyze_logger.error(f"Failed to initialize database connection: {str(e)}")
+            raise
+    raise sqlite3.OperationalError("Failed to connect to database after retries")
 
 def get_sector_growth_rate(sector: str) -> float:
     """Fetch the growth rate for a given sector from the hardcoded dictionary."""
     growth_rate = SECTOR_GROWTH_RATES.get(sector, SECTOR_GROWTH_RATES["Unknown"])
     analyze_logger.debug(f"Retrieved growth rate for sector '{sector}': {growth_rate}%")
     return growth_rate
-
-def get_file_hash(file_path: str) -> str:
-    """Compute SHA-256 hash of a file for versioning."""
-    try:
-        with open(file_path, 'rb') as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except FileNotFoundError:
-        raise FileHashError(f"File not found: {file_path}")
-    except Exception as e:
-        raise FileHashError(f"Error computing hash for {file_path}: {str(e)}")
 
 def map_fmp_sector_to_app(sector: str) -> str:
     """Map FMP sector names to app's sector names."""
@@ -447,10 +448,14 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
             analyze_logger.info(f"Cancelling fetch for {ticker} ({endpoint})")
             return None
 
+        # Log which key is being used (last 4 characters for brevity)
+        key_type = "paid" if api_key == FMP_API_KEYS[0] else "free"
+        analyze_logger.debug(f"Attempting fetch for {ticker} ({endpoint}) with {key_type} key ending in {api_key[-4:]}")
+
         limiter = paid_rate_limiter if api_key == FMP_API_KEYS[0] else free_rate_limiter
 
         for attempt in range(retries):
-            analyze_logger.debug(f"Attempt {attempt + 1}/{retries} for {ticker} ({endpoint}) with key ending in {api_key[-4:]}")
+            analyze_logger.debug(f"Attempt {attempt + 1}/{retries} for {ticker} ({endpoint}) with {key_type} key")
             try:
                 await limiter.acquire()
                 if endpoint in ["income-statement", "balance-sheet-statement", "cash-flow-statement", "key-metrics"]:
@@ -465,7 +470,8 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
                     async with session.get(url) as response:
                         if response.status == 429:
                             if update_rate_limit:
-                                update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}")
+                                update_rate_limit(f"Rate limit hit for {key_type} key ending {api_key[-4:]}")
+                            analyze_logger.warning(f"Rate limit hit for {ticker} ({endpoint}) with {key_type} key, retrying after 60 seconds")
                             await asyncio.sleep(60)
                             continue
                         elif response.status != 200:
@@ -473,14 +479,15 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
                         data = await response.json()
                         if not data:
                             raise ValueError("Empty response from API")
-                        analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker}")
+                        analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker} with {key_type} key")
                         return data
                 else:
                     async with aiohttp.ClientSession() as temp_session:
                         async with temp_session.get(url) as response:
                             if response.status == 429:
                                 if update_rate_limit:
-                                    update_rate_limit(f"Rate limit hit for key ending {api_key[-4:]}")
+                                    update_rate_limit(f"Rate limit hit for {key_type} key ending {api_key[-4:]}")
+                                analyze_logger.warning(f"Rate limit hit for {ticker} ({endpoint}) with {key_type} key, retrying after 60 seconds")
                                 await asyncio.sleep(60)
                                 continue
                             elif response.status != 200:
@@ -488,33 +495,39 @@ async def fetch_with_multiple_keys_async(ticker, endpoint, api_keys, retries=3, 
                             data = await response.json()
                             if not data:
                                 raise ValueError("Empty response from API")
-                            analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker}")
+                            analyze_logger.info(f"Successfully fetched {endpoint} data for {ticker} with {key_type} key")
                             return data
             except aiohttp.ClientError as e:
-                analyze_logger.error(f"Network error for {ticker} ({endpoint}): {str(e)}")
+                analyze_logger.error(f"Network error for {ticker} ({endpoint}) with {key_type} key: {str(e)}")
                 if attempt < retries - 1:
                     await asyncio.sleep(min(60 * (attempt + 1), 300))
                 else:
                     break
             except json.JSONDecodeError:
-                analyze_logger.error(f"JSON decoding error for {ticker} ({endpoint})")
+                analyze_logger.error(f"JSON decoding error for {ticker} ({endpoint}) with {key_type} key")
                 break
             except ValueError as e:
-                analyze_logger.error(f"Data error for {ticker} ({endpoint}): {str(e)}")
+                analyze_logger.error(f"Data error for {ticker} ({endpoint}) with {key_type} key: {str(e)}")
                 break
     analyze_logger.error(f"All attempts and keys exhausted for {ticker} ({endpoint})")
     return None
 
 async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, cancel_event=None) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[Dict], Optional[List[Dict]], Optional[List[Dict]], Optional[List[Dict]]]:
     """Fetch core financial data from FMP: income statement, balance sheet, dividends, profile, cash flow statement, and key metrics."""
-    primary_key = keys[0]
+    if not keys:
+        analyze_logger.error(f"No valid API keys provided for {ticker}")
+        return None, None, None, None, None, None
     
-    income_data = await fetch_with_multiple_keys_async(ticker, "income-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
-    balance_data = await fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
-    dividend_data = await fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
-    profile_data = await fetch_with_multiple_keys_async(ticker, "profile", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
-    cash_flow_data = await fetch_with_multiple_keys_async(ticker, "cash-flow-statement", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
-    key_metrics_data = await fetch_with_multiple_keys_async(ticker, "key-metrics", [primary_key], retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
+    # Use all keys if USE_FREE_API_KEY is True, otherwise use only the paid key
+    api_keys = keys if USE_FREE_API_KEY else [keys[0]]
+    analyze_logger.debug(f"Fetching data for {ticker} using {'all keys' if USE_FREE_API_KEY else 'paid key only'}")
+
+    income_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "income-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
+    balance_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
+    dividend_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
+    profile_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "profile", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
+    cash_flow_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "cash-flow-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
+    key_metrics_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "key-metrics", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=10)
     
     if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
         analyze_logger.error(f"FMP fetch failed for {ticker}: Incomplete data (Income: {bool(income_data)}, Balance: {bool(balance_data)}, Dividends: {bool(dividend_data)}, Profile: {bool(profile_data)}, Cash Flow: {bool(cash_flow_data)}, Key Metrics: {bool(key_metrics_data)})")
@@ -1003,8 +1016,8 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             ("cash_flow_data", cash_flow_data),
                             ("key_metrics_data", key_metrics_data)
                         ] if not data]
-                        analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
-                        return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
+                        analyze_logger.warning(f"Skipping {ticker} due to missing data: {', '.join(missing)}")
+                        return {"ticker": ticker, "exchange": ticker_exchange, "error": f"Missing data: {', '.join(missing)}"}
 
                     company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
                     sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
@@ -1104,7 +1117,7 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
         tasks.append(fetch_data(ticker))
 
     try:
-        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=600)
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=60)  # Reduced from 600s
     except asyncio.TimeoutError:
         analyze_logger.error("Timeout while fetching batch data")
         results = []
@@ -1132,6 +1145,7 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
 
     analyze_logger.debug(f"Batch fetch complete: {len(valid_results)} valid, {len(error_tickers)} errors, {cache_hits} cache hits")
     analyze_logger.debug(f"Error tickers during batch fetch: {error_tickers}")
+    analyze_logger.debug(f"Fetch_data completed for {ticker} with result: {result}")
     return valid_results, error_tickers, cache_hits
 
 async def fetch_stock_data(ticker, expected_return=0.0, margin_of_safety=0.33, exchange="Stock", ticker_manager=None, update_rate_limit=None, cancel_event=None):
@@ -1255,7 +1269,7 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
         ticker_list = list(ticker_manager.get_tickers(exchange))
         filtered_ticker_data = [{"ticker": ticker} for ticker in ticker_list]
         tickers = filtered_ticker_data if tickers is None else tickers
-        ticker_list = [t["ticker"] for t in tickers]
+        ticker_list = [t["ticker"] for t in tickers]  # Extract flat list of tickers
 
         invalid_file = os.path.join(USER_DATA_DIR, f"{exchange} Invalid Tickers.txt")
         if os.path.exists(invalid_file):
@@ -1278,7 +1292,11 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
 
         dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 6))  # 6 calls/ticker now
 
-        total_start_time = time.time()  # New: Track overall start time for running average
+        total_start_time = time.time()  # Track overall start time for running average
+
+        # Initialize progress with total tickers
+        if root and update_progress_animated:
+            root.after(0, lambda p=0, t=valid_tickers, pt=0, e=0: update_progress_animated(p, t, pt, e))
 
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
@@ -1299,8 +1317,8 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
                 
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
-                sector = result.get('sector', 'Unknown')  # New: Check sector
-                if separate_financials and sector != "Financials":  # Skip non-financials if flag is True
+                sector = result.get('sector', 'Unknown')
+                if separate_financials and sector != "Financials":
                     if log_full:
                         screening_logger.info(f"{ticker}: Skipped - Not financial (sector: {sector})")
                     continue
@@ -1329,14 +1347,17 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
                 processed_tickers += 1
                 progress = (processed_tickers / total_tickers) * 100
                 
-                # New: Calculate running average time per ticker and ETA based on total remaining
                 elapsed_total = time.time() - total_start_time
                 avg_time_per_ticker = elapsed_total / processed_tickers if processed_tickers > 0 else 0
                 remaining_tickers = total_tickers - processed_tickers
                 eta = remaining_tickers * avg_time_per_ticker
                 
                 if root and update_progress_animated:
-                    root.after(0, lambda p=progress, t=valid_tickers, pt=passed_tickers, e=eta: update_progress_animated(p, t, pt, e))
+                    try:
+                        print(f"Attempting to update progress for {ticker}: {progress:.1f}%")  # Debug print
+                        root.after(0, lambda p=progress, t=valid_tickers, pt=passed_tickers, e=eta: update_progress_animated(p, t, pt, e))
+                    except Exception as e:
+                        analyze_logger.error(f"Error scheduling progress update for {ticker}: {str(e)}")
                 cursor.execute("INSERT OR REPLACE INTO screening_progress (exchange, ticker, timestamp, file_hash, status) VALUES (?, ?, ?, ?, ?)",
                             (exchange, ticker, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_file_hash, "completed"))
                 conn.commit()
@@ -1364,7 +1385,7 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
             error_sample = random.sample(error_tickers, sample_size)
             screening_logger.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
 
-        return qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks  # Updated return
+        return qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks
     finally:
         conn.close()
 
