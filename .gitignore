@@ -1,8 +1,9 @@
-"api_cache.db" 
-"*.log" 
-"otherlisted.txt" 
-"nasdaqlisted.txt" 
-"stock_favorites.json" 
-"GrahamStockAnalysis.spec" 
-"build/" 
-"dist/" 
+api_cache.db
+*.log
+otherlisted.txt
+nasdaqlisted.txt
+stock_favorites.json
+GrahamStockAnalysis.spec
+__pycache__/
+build/
+dist/
