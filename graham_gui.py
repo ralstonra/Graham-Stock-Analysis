@@ -16,7 +16,8 @@ from graham_data import (screen_exchange_graham_stocks, fetch_batch_data,
                          NYSE_LIST_FILE, NASDAQ_LIST_FILE, TickerManager, get_file_hash,
                          calculate_graham_value, calculate_graham_score_8, calculate_common_criteria, 
                          clear_in_memory_caches, save_qualifying_stocks_to_favorites, get_stock_data_from_db,
-                         get_sector_growth_rate, calculate_cagr, get_aaa_yield)
+                         get_sector_growth_rate, calculate_cagr, get_aaa_yield, get_bank_metrics,
+                         get_tangible_book_value_per_share)
 from config import (
     BASE_DIR, FMP_API_KEYS, FAVORITES_FILE, paid_rate_limiter, free_rate_limiter, 
     CACHE_EXPIRY, screening_logger, analyze_logger, USER_DATA_DIR, FRED_API_KEY
@@ -26,6 +27,9 @@ import shutil
 import requests
 import ftplib
 import openpyxl
+import re
+import subprocess
+import platform
 from openpyxl.chart import LineChart, Reference, Series, ScatterChart
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
@@ -46,6 +50,7 @@ class GrahamScreeningApp:
         # Variables
         self.nyse_screen_var = tk.BooleanVar(value=False)
         self.nasdaq_screen_var = tk.BooleanVar(value=False)
+        self.financial_screen_var = tk.BooleanVar(value=False)
         self.cancel_event = threading.Event()
         self.margin_of_safety_var = tk.DoubleVar(value=33.0)
         self.expected_return_var = tk.DoubleVar(value=0.0)
@@ -103,6 +108,8 @@ class GrahamScreeningApp:
         self.create_tooltip(self.expected_return_label, "Premium above intrinsic value for sell target")
         self.create_tooltip(self.analyze_button, "Analyze the entered tickers")
         self.create_tooltip(self.progress_bar, "Shows progress of screening or analysis")
+
+        self.check_for_updates()
 
     # New: Helper method for tooltips
     def create_tooltip(self, widget: tk.Widget, text: str) -> None:
@@ -271,6 +278,7 @@ class GrahamScreeningApp:
             state="readonly"
         )
         self.sector_menu.grid(row=12, column=0, pady=2, sticky="ew")
+        ttk.Checkbutton(self.right_frame, text="Screen Financials Separately", variable=self.financial_screen_var).grid(row=13, column=0, pady=2, padx=2, sticky="w")
 
         # Treeview and Tabs
         self.full_tree_frame = ttk.Frame(self.main_frame)
@@ -335,7 +343,10 @@ class GrahamScreeningApp:
 
     def validate_tickers(self):
         tickers = self.parse_tickers(self.entry.get())
-        return bool(tickers)
+        valid = all(self.ticker_manager.is_valid_ticker(t) for t in tickers)
+        self.entry.config(style="Invalid.TEntry" if not valid else "TEntry")
+        # In __init__, add: style.configure("Invalid.TEntry", fieldbackground="pink")
+        return valid
 
     def parse_tickers(self, tickers_input):
         if not tickers_input or not tickers_input.strip():
@@ -371,10 +382,10 @@ class GrahamScreeningApp:
         if tickers is not None and isinstance(tickers, (list, tuple)):
             total_tickers = len(tickers)
             processed = int(progress / 100 * total_tickers)
-            eta_text = f", ETA: {eta:.2f} seconds" if eta is not None else ""
+            eta_text = f", ETA: {str(timedelta(seconds=int(eta)))[:-3]}" if eta is not None else ""
             self.progress_label.config(text=f"Progress: {progress:.1f}% ({processed}/{total_tickers} stocks processed, {passed_tickers} passed{eta_text})")
         else:
-            eta_text = f", ETA: {eta:.2f} seconds" if eta is not None else ""
+            eta_text = f", ETA: {str(timedelta(seconds=int(eta)))[:-3]}" if eta is not None else ""
             self.progress_label.config(text=f"Progress: {progress:.1f}% (Screening, {passed_tickers} passed{eta_text})")
         self.root.update_idletasks()
 
@@ -450,10 +461,12 @@ class GrahamScreeningApp:
 
         min_criteria = self.min_criteria_var.get()
         sector_filter = self.sector_filter_var.get() if self.sector_filter_var.get() != "All" else None  # New: Get sector
+        separate_financials = self.financial_screen_var.get()  # Added: Pass checkbox value
+
         async def screening_task():
             try:
                 await self.ticker_manager.initialize()
-                qualifying_stocks, common_scores, exchanges, error_tickers = await screen_func(
+                qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks = await screen_func(  # Updated return unpacking
                     exchange=exchange,  # New param
                     batch_size=50,
                     cancel_event=self.cancel_event,
@@ -463,7 +476,8 @@ class GrahamScreeningApp:
                     ticker_manager=self.ticker_manager,
                     update_rate_limit=self.update_rate_limit,
                     min_criteria=min_criteria,
-                    sector_filter=sector_filter  # New: Pass sector
+                    sector_filter=sector_filter,  # New: Pass sector
+                    separate_financials=separate_financials  # Added
                 )
                 screening_logger.info(f"Qualifying stocks for {exchange}: {qualifying_stocks}")
                 if not self.cancel_event.is_set():
@@ -489,6 +503,8 @@ class GrahamScreeningApp:
                         )
                         self.root.after(0, lambda: self.update_cache_usage(cache_hits, total_tickers))
                         summary = f"Completed {exchange} screening.\nProcessed {total_tickers} stocks,\nFound {len(qualifying_stocks)} qualifiers,\n{len(error_tickers)} errors"
+                        if separate_financials:
+                            summary += f"\nFinancial qualifiers: {len(financial_qualifying_stocks)}"
                         if error_tickers:
                             summary += f"\nError tickers: {', '.join(error_tickers)}"
                         self.root.after(0, lambda: messagebox.showinfo("Screening Complete", summary))
@@ -544,7 +560,7 @@ class GrahamScreeningApp:
                 timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').timestamp() if timestamp_str else 0
                 if ((stored_exchange == "NYSE" and stored_hash == nyse_file_hash) or 
                     (stored_exchange == "NASDAQ" and stored_hash == nasdaq_file_hash)) and \
-                   (time.time() - timestamp < CACHE_EXPIRY):
+                (time.time() - timestamp < CACHE_EXPIRY):
                     cursor.execute("SELECT * FROM stocks WHERE ticker=?", (ticker,))
                     stock_row = cursor.fetchone()
                     if stock_row:
@@ -583,7 +599,8 @@ class GrahamScreeningApp:
                         buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
                         sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
                         latest_revenue = stock_dict['latest_revenue']
-                        graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data, stock_dict['available_data_years'], latest_revenue)
+                        key_metrics_data = json.loads(stock_dict.get('key_metrics_data', '[]'))
+                        graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data, key_metrics_data, stock_dict['available_data_years'], latest_revenue, sector)
 
                         result = {
                             "ticker": stock_dict['ticker'],
@@ -958,70 +975,84 @@ class GrahamScreeningApp:
             self.tree.move(k, '', index)
 
     def display_nyse_qualifying_stocks(self):
+        """Display NYSE qualifying stocks in the treeview with company names and scores out of 6."""
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute(""" 
-                SELECT ticker, common_score, sector 
-                FROM graham_qualifiers 
-                WHERE exchange='NYSE' AND common_score IS NOT NULL
-                ORDER BY common_score DESC, ticker ASC
-            """)
-            qualifier_results = cursor.fetchall()
+            cursor.execute("""
+                SELECT g.ticker, s.company_name, g.sector, g.common_score
+                FROM graham_qualifiers g
+                JOIN stocks s ON g.ticker = s.ticker
+                WHERE g.exchange = 'NYSE' AND g.min_criteria = ?
+                ORDER BY g.common_score DESC, g.ticker ASC
+            """, (self.min_criteria_var.get(),))
+            results = cursor.fetchall()
 
-            if not qualifier_results:
-                messagebox.showinfo("No Results", "No NYSE stocks meet the Graham criteria.")
-                analyze_logger.info("No qualifying NYSE stocks found in graham_qualifiers.")
-                return
-
-            cursor.execute("SELECT ticker, company_name FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NYSE')")
-            ticker_to_company = {row[0]: row[1] for row in cursor.fetchall()}
-
+            # Clear tree
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            for ticker, common_score, sector in qualifier_results:
-                company_name = ticker_to_company.get(ticker, "Unknown")
-                self.tree.insert("", "end", text=ticker, values=(company_name, sector, f"{common_score}/6", "", "", "", ""))
-                analyze_logger.debug(f"Added {ticker} to treeview: {company_name}, Sector: {sector}, Score: {common_score}/6")
+            if not results:
+                self.tree.insert("", "end", text="No qualifying stocks found",
+                                values=("", "", "", "", "", "", ""))
+                analyze_logger.info(f"No NYSE qualifiers found for min_criteria={self.min_criteria_var.get()}")
+                return
 
-            analyze_logger.info(f"Displayed {len(qualifier_results)} NYSE qualifying stocks in treeview.")
+            # Populate treeview
+            for ticker, company_name, sector, common_score in results:
+                display_name = company_name if company_name else ticker
+                self.tree.insert("", "end", text=ticker, values=(
+                    display_name, sector, f"{common_score}/6", "", "", "", ""
+                ), tags=('financial',) if sector == 'Financials' else ())
+                analyze_logger.debug(f"Displayed NYSE {ticker}: {display_name} (Sector: {sector}, Score: {common_score}/6)")
+
+            self.tree.tag_configure('financial', foreground='blue')  # Visual distinction for financials
+            self.sort_tree(0)
+            analyze_logger.info(f"Displayed {len(results)} NYSE qualifying stocks")
         except sqlite3.Error as e:
-            analyze_logger.error(f"Database error in display_nyse_qualifying_stocks: {str(e)}")
-            messagebox.showerror("Error", f"Database error: {str(e)}")
+            error_msg = f"Database error displaying NYSE qualifiers: {str(e)}"
+            analyze_logger.error(error_msg)
+            messagebox.showerror("Database Error", error_msg)
         finally:
             conn.close()
 
     def display_nasdaq_qualifying_stocks(self):
+        """Display NASDAQ qualifying stocks in the treeview with company names and scores out of 6."""
         conn, cursor = get_stocks_connection()
         try:
-            cursor.execute(""" 
-                SELECT ticker, common_score, sector 
-                FROM graham_qualifiers 
-                WHERE exchange='NASDAQ' AND common_score IS NOT NULL
-                ORDER BY common_score DESC, ticker ASC
-            """)
-            qualifier_results = cursor.fetchall()
+            cursor.execute("""
+                SELECT g.ticker, s.company_name, g.sector, g.common_score
+                FROM graham_qualifiers g
+                JOIN stocks s ON g.ticker = s.ticker
+                WHERE g.exchange = 'NASDAQ' AND g.min_criteria = ?
+                ORDER BY g.common_score DESC, g.ticker ASC
+            """, (self.min_criteria_var.get(),))
+            results = cursor.fetchall()
 
-            if not qualifier_results:
-                messagebox.showinfo("No Results", "No NASDAQ stocks meet the Graham criteria.")
-                analyze_logger.info("No qualifying NASDAQ stocks found in graham_qualifiers.")
-                return
-
-            cursor.execute("SELECT ticker, company_name FROM stocks WHERE ticker IN (SELECT ticker FROM graham_qualifiers WHERE exchange='NASDAQ')")
-            ticker_to_company = {row[0]: row[1] for row in cursor.fetchall()}
-
+            # Clear tree
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            for ticker, common_score, sector in qualifier_results:
-                company_name = ticker_to_company.get(ticker, "Unknown")
-                self.tree.insert("", "end", text=ticker, values=(company_name, sector, f"{common_score}/6", "", "", "", ""))
-                analyze_logger.debug(f"Added {ticker} to treeview: {company_name}, Sector: {sector}, Score: {common_score}/6")
+            if not results:
+                self.tree.insert("", "end", text="No qualifying stocks found",
+                                values=("", "", "", "", "", "", ""))
+                analyze_logger.info(f"No NASDAQ qualifiers found for min_criteria={self.min_criteria_var.get()}")
+                return
 
-            analyze_logger.info(f"Displayed {len(qualifier_results)} NASDAQ qualifying stocks in treeview.")
+            # Populate treeview
+            for ticker, company_name, sector, common_score in results:
+                display_name = company_name if company_name else ticker
+                self.tree.insert("", "end", text=ticker, values=(
+                    display_name, sector, f"{common_score}/6", "", "", "", ""
+                ), tags=('financial',) if sector == 'Financials' else ())
+                analyze_logger.debug(f"Displayed NASDAQ {ticker}: {display_name} (Sector: {sector}, Score: {common_score}/6)")
+
+            self.tree.tag_configure('financial', foreground='blue')  # Visual distinction for financials
+            self.sort_tree(0)
+            analyze_logger.info(f"Displayed {len(results)} NASDAQ qualifying stocks")
         except sqlite3.Error as e:
-            analyze_logger.error(f"Database error in display_nasdaq_qualifying_stocks: {str(e)}")
-            messagebox.showerror("Error", f"Database error: {str(e)}")
+            error_msg = f"Database error displaying NASDAQ qualifiers: {str(e)}"
+            analyze_logger.error(error_msg)
+            messagebox.showerror("Database Error", error_msg)
         finally:
             conn.close()
 
@@ -1171,6 +1202,17 @@ class GrahamScreeningApp:
                 else:
                     cell.alignment = Alignment(wrap_text=False, horizontal='left', vertical='center')
 
+    def get_tangible_book_value_per_share(key_metrics_data: list) -> float:
+        """Extract latest tangible book value per share from key_metrics_data."""
+        if not key_metrics_data:
+            return 0.0
+        latest = key_metrics_data[0]
+        tbvps = latest.get('tangibleBookValuePerShare', 0.0)
+        try:
+            return float(tbvps)
+        except (ValueError, TypeError):
+            return 0.0
+
     def export_qualifying_stocks(self, exchange, min_criteria):
         analyze_logger.debug(f"Exporting {exchange} qualifying stocks with min_criteria={min_criteria}")
 
@@ -1223,6 +1265,9 @@ class GrahamScreeningApp:
                     analyze_logger.error(f"Error parsing data for {ticker}: {e}")
                     continue
 
+                # Compute tangible BVPS from raw_key_metrics_data
+                tangible_bvps = get_tangible_book_value_per_share(json.loads(raw_key_metrics_data) if raw_key_metrics_data else [])
+
                 intrinsic_value = self.calculate_intrinsic_value({'eps_ttm': eps_ttm, 'eps_cagr': eps_cagr})
                 if pd.isna(intrinsic_value) or intrinsic_value == 0:
                     margin_of_safety = "N/A"
@@ -1230,7 +1275,7 @@ class GrahamScreeningApp:
                     margin_of_safety = (intrinsic_value - price) / intrinsic_value * 100  # Percent current price is below/above intrinsic value
                 expected_return = self.expected_return_var.get() / 100
                 buy_price = intrinsic_value * (1 - (self.margin_of_safety_var.get() / 100)) if not pd.isna(intrinsic_value) else "N/A"
-                graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data_dict, available_data_years, latest_revenue)
+                graham_score = calculate_graham_score_8(ticker, price, None, None, debt_to_equity, eps_list, div_list, {}, balance_data_dict, json.loads(raw_key_metrics_data) if raw_key_metrics_data else [], available_data_years, latest_revenue, sector)
 
                 stock_data = {
                     "company_name": company_name,
@@ -1246,7 +1291,9 @@ class GrahamScreeningApp:
                     "latest_shares_outstanding": latest_shares_outstanding,
                     "latest_current_assets": latest_current_assets,
                     "latest_current_liabilities": latest_current_liabilities,
-                    "free_cash_flow": latest_free_cash_flow
+                    "free_cash_flow": latest_free_cash_flow,
+                    "raw_key_metrics_data": raw_key_metrics_data,  # Added for bank_metrics
+                    "tangible_book_value_per_share": tangible_bvps  # Added for P/TBV
                 }
                 stock_data_list.append(stock_data)
 
@@ -1269,8 +1316,12 @@ class GrahamScreeningApp:
             ]
 
             # Function to create a summary sheet
-            def create_summary_sheet(sheet_name, stocks):
+            def create_summary_sheet(sheet_name, stocks, is_financial=False):
                 sheet = wb.create_sheet(sheet_name)
+                headers = ["Company Name", "Ticker", "Sector", "Bargain?", "MOS", "Graham Score", "Stability Test", "ROE>12%", "ROTC>12%", "EPS Uptrend", "LTD<5 Years", "Dividend", "Buyback", "POT #1", "POT #2", "Current Price", "Intrinsic Value", "Buy Price"]
+                if is_financial:
+                    headers.extend(["ROA", "ROE", "NIM", "P/TBV"])  # Extra columns for financials
+                
                 for col, header in enumerate(headers, start=1):
                     cell = sheet.cell(row=1, column=col, value=header)
                     cell.font = Font(size=12, bold=True)
@@ -1306,6 +1357,17 @@ class GrahamScreeningApp:
                     sheet.cell(row=row_idx, column=16, value=stock["current_price"] if stock["current_price"] != "N/A" else "N/A")
                     sheet.cell(row=row_idx, column=17, value=stock["intrinsic_value"] if stock["intrinsic_value"] != "N/A" else "N/A")
                     sheet.cell(row=row_idx, column=18, value=stock["buy_price"] if stock["buy_price"] != "N/A" else "N/A")
+                    
+                    if is_financial:
+                        # Compute financial metrics
+                        bank_metrics = get_bank_metrics(json.loads(stock["raw_key_metrics_data"]) if "raw_key_metrics_data" in stock else [])
+                        tangible_bvps = stock.get("tangible_book_value_per_share", 0)
+                        price = stock.get("current_price", 1)
+                        ptbv = price / tangible_bvps if tangible_bvps > 0 else "N/A"
+                        sheet.cell(row=row_idx, column=19, value=bank_metrics.get('roa', "N/A"))
+                        sheet.cell(row=row_idx, column=20, value=bank_metrics.get('roe', "N/A"))
+                        sheet.cell(row=row_idx, column=21, value=bank_metrics.get('netInterestMargin', "N/A"))
+                        sheet.cell(row=row_idx, column=22, value=ptbv)
 
                 # Set number formats for numeric columns
                 last_row = len(stocks) + 1
@@ -1319,6 +1381,11 @@ class GrahamScreeningApp:
                     sheet.cell(row=row, column=16).number_format = '$#,##0.00'  # Current Price
                     sheet.cell(row=row, column=17).number_format = '$#,##0.00'  # Intrinsic Value
                     sheet.cell(row=row, column=18).number_format = '$#,##0.00'  # Buy Price
+                    if is_financial:
+                        sheet.cell(row=row, column=19).number_format = '0.00%'  # ROA
+                        sheet.cell(row=row, column=20).number_format = '0.00%'  # ROE
+                        sheet.cell(row=row, column=21).number_format = '0.00%'  # NIM
+                        sheet.cell(row=row, column=22).number_format = '0.00'   # P/TBV
 
                 # Define fill colors
                 green_fill = PatternFill(start_color='00FF00', end_color='00FF00', fill_type='solid')
@@ -1400,6 +1467,8 @@ class GrahamScreeningApp:
 
                 # Set column widths
                 column_widths = [55, 12, 25, 14, 10, 19, 18, 14, 16, 18, 17, 14, 14, 12, 12, 18, 20, 15]
+                if is_financial:
+                    column_widths.extend([10, 10, 10, 10])  # Extra widths for ROA, ROE, NIM, P/TBV
                 for col, width in enumerate(column_widths, start=1):
                     sheet.column_dimensions[get_column_letter(col)].width = width
 
@@ -1408,10 +1477,12 @@ class GrahamScreeningApp:
                     for cell in row:
                         cell.alignment = Alignment(horizontal='center', vertical='center')
 
-                # Auto-filter range includes all columns (A to R)
-                sheet.auto_filter.ref = f"A1:R{last_row}"
+                # Auto-filter range includes all columns (A to R or more for financial)
+                last_col_letter = get_column_letter(len(headers))
+                sheet.auto_filter.ref = f"A1:{last_col_letter}{last_row}"
                 sheet.auto_filter.add_sort_condition(f"A2:A{last_row}")
 
+            # Update the calls to create_summary_sheet
             # Create 'Winning Stocks' sheet for non-financial stocks
             if other_stocks:
                 create_summary_sheet("Winning Stocks", other_stocks)
@@ -1419,7 +1490,7 @@ class GrahamScreeningApp:
 
             # Create 'Financial Winners' sheet for financial stocks
             if financial_stocks:
-                create_summary_sheet("Financial Winners", financial_stocks)
+                create_summary_sheet("Financial Winners", financial_stocks, is_financial=True)
                 print(f"Created 'Financial Winners' sheet with {len(financial_stocks)} stocks")
             else:
                 print("No financial stocks to create 'Financial Winners' sheet")
@@ -2509,6 +2580,96 @@ class GrahamScreeningApp:
 
     def safe_insert(self, text_widget, content):
         self.root.after(0, lambda: text_widget.insert(tk.END, content))
+
+    def check_for_updates(self):
+        """Perform a startup check for Python and library updates."""
+        msg = []
+        
+        # Check Python version
+        latest_python = self.get_latest_python_version()
+        current_python = sys.version_info[:3]
+        if latest_python and current_python < latest_python:
+            current_str = '.'.join(map(str, current_python))
+            latest_str = '.'.join(map(str, latest_python))
+            msg.append(f"Python version {current_str} is outdated. Latest is {latest_str}. "
+                       f"Please download and install from https://www.python.org/downloads/ manually.")
+        
+        # Check libraries
+        outdated_packages = self.get_outdated_packages()
+        if outdated_packages is None:
+            msg.append("Failed to check for library updates (pip error). Please run 'pip list --outdated' manually.")
+        elif outdated_packages:
+            msg.append("The following libraries have updates available:\n" + "\n".join(outdated_packages))
+        
+        if msg:
+            full_msg = "\n\n".join(msg)
+            if outdated_packages and outdated_packages is not None:  # Offer update only if libraries are outdated
+                full_msg += "\n\nWould you like to update the libraries now? (Python update is manual.)"
+                if messagebox.askyesno("Updates Available", full_msg):
+                    self.update_packages(outdated_packages)
+                    messagebox.showinfo("Update Complete", "Libraries updated successfully. Please restart the application.")
+                    self.root.quit()  # Quit the app to encourage restart
+            else:
+                messagebox.showwarning("Updates Recommended", full_msg)
+
+    def get_latest_python_version(self):
+        """Fetch the latest Python 3 version from python.org."""
+        try:
+            response = requests.get("https://www.python.org/downloads/")
+            response.raise_for_status()
+            # Parse for "Python 3.xx.x" (adjust regex if page structure changes)
+            match = re.search(r"Python (\d+\.\d+\.\d+)", response.text)
+            if match:
+                return tuple(map(int, match.group(1).split('.')))
+        except Exception as e:
+            analyze_logger.warning(f"Failed to fetch latest Python version: {str(e)}")
+        # Fallback to known latest (as of September 2025)
+        return (3, 13, 7)
+
+    def get_outdated_packages(self):
+        """Get list of outdated pip packages."""
+        try:
+            shell = (platform.system() == 'Windows')  # Use shell=True on Windows
+            # Replace pythonw.exe with python.exe if necessary
+            executable = sys.executable
+            if executable.endswith('pythonw.exe'):
+                executable = executable[:-len('pythonw.exe')] + 'python.exe'
+            cmd = [executable, '-m', 'pip', 'list', '--outdated'] if executable else ['pip', 'list', '--outdated']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, shell=shell)
+            outdated = result.stdout.strip()
+            if outdated:
+                # Parse table output (skip header lines starting with "Package" or "---")
+                lines = outdated.splitlines()
+                packages = []
+                for line in lines[2:]:  # Skip header and separator line
+                    if line.strip():  # Ignore empty lines
+                        parts = line.split()
+                        if parts:  # Ensure there's at least one part (package name)
+                            packages.append(parts[0])
+                return packages
+            return []
+        except subprocess.CalledProcessError as e:
+            analyze_logger.error(f"Pip subprocess error: Command '{e.cmd}' failed with return code {e.returncode}. Stderr: {e.stderr}")
+            return None
+        except Exception as e:
+            analyze_logger.error(f"Error checking pip updates: {str(e)}")
+            return None
+
+    def update_packages(self, packages):
+        """Update the specified packages via pip."""
+        shell = (platform.system() == 'Windows')  # Use shell=True on Windows
+        for pkg in packages:
+            try:
+                # Replace pythonw.exe with python.exe if necessary
+                executable = sys.executable
+                if executable.endswith('pythonw.exe'):
+                    executable = executable[:-len('pythonw.exe')] + 'python.exe'
+                cmd = [executable, '-m', 'pip', 'install', '--upgrade', pkg] if executable else ['pip', 'install', '--upgrade', pkg]
+                subprocess.run(cmd, check=True, shell=shell)
+                analyze_logger.info(f"Updated package: {pkg}")
+            except Exception as e:
+                messagebox.showerror("Update Error", f"Failed to update {pkg}: {str(e)}")
+                analyze_logger.error(f"Failed to update {pkg}: {str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()

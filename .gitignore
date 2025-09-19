@@ -1,2 +1,8 @@
-__pycache__/ 
-*.pyc
+"api_cache.db" 
+"*.log" 
+"otherlisted.txt" 
+"nasdaqlisted.txt" 
+"stock_favorites.json" 
+"GrahamStockAnalysis.spec" 
+"build/" 
+"dist/" 

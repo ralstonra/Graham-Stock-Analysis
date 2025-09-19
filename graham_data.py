@@ -146,7 +146,8 @@ def get_stocks_connection():
                     raw_dividend_data TEXT,
                     raw_profile_data TEXT,
                     raw_cash_flow_data TEXT,
-                    raw_key_metrics_data TEXT
+                    raw_key_metrics_data TEXT,
+                    exchange TEXT
                 )''')
                 cursor.execute("PRAGMA table_info(stocks)")
                 columns = [col[1] for col in cursor.fetchall()]
@@ -168,14 +169,15 @@ def get_stocks_connection():
                     'raw_dividend_data TEXT',
                     'raw_profile_data TEXT',
                     'raw_cash_flow_data TEXT',
-                    'raw_key_metrics_data TEXT'
+                    'raw_key_metrics_data TEXT',
+                    'exchange'
                 ]
                 for col in new_columns:
                     col_name = col.split()[0]
                     if col_name not in columns:
                         cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col}")
                         analyze_logger.info(f"Added '{col_name}' column to stocks table")
-                
+
                 # Create or update the 'graham_qualifiers' table
                 cursor.execute('''CREATE TABLE IF NOT EXISTS graham_qualifiers (
                     ticker TEXT PRIMARY KEY,
@@ -668,49 +670,123 @@ def calculate_common_criteria(ticker: str, eps_list: List[float], div_list: List
     analyze_logger.debug(f"{ticker}: Common Score = {score}/6 with {available_data_years} years of data")
     return score
 
-def calculate_graham_score_8(ticker: str, price: float, pe_ratio: Optional[float], pb_ratio: Optional[float], debt_to_equity: Optional[float], eps_list: List[float], div_list: List[float], revenue: Dict[str, float], balance_data: List[Dict], available_data_years: int, latest_revenue: float) -> int:
-    """Calculate full Graham score with 8 criteria."""
+# Extract tangible BVPS from key_metrics
+def get_tangible_book_value_per_share(key_metrics_data: List[Dict]) -> Optional[float]:
+    if key_metrics_data and 'tangibleBookValuePerShare' in key_metrics_data[0]:
+        return float(key_metrics_data[0]['tangibleBookValuePerShare'])
+    return None
+
+# Tailored criteria for financials
+def calculate_financial_common_criteria(ticker: str, eps_list: List[float], div_list: List[float], revenue: Dict[str, float], 
+                                        balance_data: List[Dict], key_metrics_data: List[Dict], available_data_years: int, 
+                                        latest_revenue: float) -> Optional[int]:
+    if available_data_years < 10:
+        analyze_logger.warning(f"{ticker}: Insufficient data - {available_data_years} years")
+        return None
+
     score = 0
-    common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data, debt_to_equity, available_data_years, latest_revenue)
-    if common_score is not None:
-        score += common_score
-        analyze_logger.debug(f"{ticker}: Common Score (part of Graham 8) = {common_score}/6")
-    else:
-        analyze_logger.warning(f"{ticker}: Common score is None, setting to 0")
-    if pe_ratio is not None and pe_ratio <= 15:
+
+    # Common: Revenue, Current Ratio, EPS Stability, Dividends, EPS Growth (same as non-financial)
+    # (Reuse logic from calculate_common_criteria, but omit debt/equity)
+    revenue_passed = latest_revenue >= 500_000_000  # Or higher for banks, e.g., 1B?
+    if revenue_passed:
         score += 1
-        analyze_logger.debug(f"{ticker}: Criterion 7 - P/E Ratio <= 15: Passed (P/E = {pe_ratio})")
-    else:
-        analyze_logger.debug(f"{ticker}: Criterion 7 - P/E Ratio <= 15: Failed (P/E = {pe_ratio})")
-    if pb_ratio is not None and pb_ratio <= 1.5:
+
+    latest_balance = balance_data[-1] if balance_data else {}
+    current_assets = float(latest_balance.get('totalCurrentAssets', 0))
+    current_liabilities = float(latest_balance.get('totalCurrentLiabilities', 1))
+    current_ratio = current_assets / current_liabilities if current_liabilities > 0 else 0
+    if current_ratio > 2:  # Graham liked >1.5 for financials, but keep 2 for defensive
         score += 1
-        analyze_logger.debug(f"{ticker}: Criterion 8 - P/B Ratio <= 1.5: Passed (P/B = {pb_ratio})")
-    else:
-        analyze_logger.debug(f"{ticker}: Criterion 8 - P/B Ratio <= 1.5: Failed (P/B = {pb_ratio})")
-    analyze_logger.debug(f"{ticker}: Full Graham Score = {score}/8 with {available_data_years} years of data")
+
+    if sum(1 for eps in eps_list if eps <= 0) == 0:
+        score += 1
+
+    if all(div > 0 for div in div_list):
+        score += 1
+
+    if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
+        cagr = calculate_cagr(eps_list[0], eps_list[-1], available_data_years - 1)
+        if cagr > 0.03:  # Keep 3%, but could lower to 2% for banks' cyclicality
+            score += 1
+
+    # Financial-specific: Capital strength (equity/assets > 10%), ROA >1%, ROE >10%, NIM >3%
+    latest_balance = balance_data[0] if balance_data else {}  # Latest is first in descending data
+    total_assets = float(latest_balance.get('totalAssets', 1))
+    equity = float(latest_balance.get('totalStockholdersEquity', 0))
+    equity_to_assets = (equity / total_assets) * 100 if total_assets > 0 else 0
+    if equity_to_assets > 10:  # Proxy for CET1/leverage; Graham favored strong capital
+        score += 1
+    analyze_logger.debug(f"{ticker}: Equity/Assets >10%: {'Yes' if equity_to_assets > 10 else 'No'} ({equity_to_assets:.2f}%)")
+
+    bank_metrics = get_bank_metrics(key_metrics_data)
+    if bank_metrics['roa'] is not None and bank_metrics['roa'] > 0.01:
+        score += 1
+    if bank_metrics['roe'] is not None and bank_metrics['roe'] > 0.10:
+        score += 1
+    if bank_metrics['netInterestMargin'] is not None and bank_metrics['netInterestMargin'] > 0.03:
+        score += 1
+
+    analyze_logger.debug(f"{ticker}: Financial Score = {score}/9 with {available_data_years} years")  # 5 common + 4 financial
     return score
 
+def calculate_graham_score_8(ticker: str, price: float, pe_ratio: Optional[float], pb_ratio: Optional[float], 
+                             debt_to_equity: Optional[float], eps_list: List[float], div_list: List[float], 
+                             revenue: Dict[str, float], balance_data: List[Dict], key_metrics_data: List[Dict],
+                             available_data_years: int, latest_revenue: float, sector: str) -> int:
+    is_financial = (sector == "Financials")
+    if is_financial:
+        common_score = calculate_financial_common_criteria(ticker, eps_list, div_list, revenue, balance_data, 
+                                                           key_metrics_data, available_data_years, latest_revenue)
+        # Use P/TBV instead of P/B
+        tangible_bvps = get_tangible_book_value_per_share(key_metrics_data)
+        ptbv_ratio = price / tangible_bvps if tangible_bvps and tangible_bvps > 0 else None
+        pb_passed = ptbv_ratio <= 1.5 if ptbv_ratio is not None else False
+    else:
+        common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data, debt_to_equity, 
+                                                 available_data_years, latest_revenue)
+        pb_passed = pb_ratio <= 1.5 if pb_ratio is not None else False
+
+    score = common_score or 0
+    if pe_ratio is not None and pe_ratio <= 15:
+        score += 1
+    if pb_passed:
+        score += 1
+    return score
+
+def get_bank_metrics(key_metrics_data: list) -> dict:
+    """Extract latest ROA, ROE, and Net Interest Margin from key_metrics_data for financial stocks.
+    Safely converts to float or returns None on failure."""
+    if not key_metrics_data:
+        return {'roa': None, 'roe': None, 'netInterestMargin': None}
+    
+    latest = key_metrics_data[0]
+    
+    def safe_float(value):
+        try:
+            return float(value) if value is not None else None
+        except (ValueError, TypeError):
+            analyze_logger.warning(f"Failed to convert value to float: {value} (type: {type(value)})")
+            return None
+    
+    roa = safe_float(latest.get('returnOnAssets'))
+    roe = safe_float(latest.get('returnOnEquity'))
+    nim = safe_float(latest.get('netInterestMargin'))
+    
+    return {'roa': roa, 'roe': roe, 'netInterestMargin': nim}
+
 async def calculate_graham_value(earnings: Optional[float], stock_data: dict) -> float:
-    """
-    Calculate Graham intrinsic value using Moody's AAA yield and stock-specific EPS CAGR.
-    Caps the growth rate at zero to avoid negative intrinsic values when CAGR is negative.
-    """
     if not earnings or earnings <= 0:
-        analyze_logger.warning(f"Invalid earnings for {stock_data['ticker']}: {earnings}")
         return float('nan')
     aaa_yield = get_aaa_yield(FRED_API_KEY)
     if aaa_yield <= 0:
-        analyze_logger.error("Moody's AAA yield is zero or negative.")
         return float('nan')
-    # Get EPS CAGR from stock data, default to 0.0 if not present
     eps_cagr = stock_data.get('eps_cagr', 0.0)
-    # Convert to percentage and cap at 0 to handle negative CAGR
     g = max(eps_cagr * 100, 0)
-    # Calculate earnings multiplier, capped between 8.5 (no growth) and 20 (max growth)
-    earnings_multiplier = min(8.5 + 2 * g, 20)
+    max_multiplier = 15 if stock_data.get('sector') == "Financials" else 20  # Lower cap for financials
+    earnings_multiplier = min(8.5 + 2 * g, max_multiplier)
     normalization_factor = 4.4
     value = (earnings * earnings_multiplier * normalization_factor) / (100 * aaa_yield)
-    analyze_logger.debug(f"Calculated Graham value for {stock_data['ticker']}: EPS={earnings}, eps_cagr={eps_cagr}, Earnings Multiplier={earnings_multiplier}, AAA Yield={aaa_yield}, Value={value}")
     return value
 
 async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, margin_of_safety=0.33, exchange="Stock", ticker_manager=None, update_rate_limit=None, cancel_event=None):
@@ -754,9 +830,9 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                     latest_current_liabilities, latest_book_value, historic_pe_ratios,
                     latest_net_income, eps_cagr, latest_free_cash_flow,
                     raw_income_data, raw_balance_data, raw_dividend_data, raw_profile_data,
-                    raw_cash_flow_data, raw_key_metrics_data) 
+                    raw_cash_flow_data, raw_key_metrics_data, exchange) 
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result['ticker'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  ",".join(map(str, result['roe_list'] if 'roe_list' in result else [])),
                  ",".join(map(str, result['rotc_list'] if 'rotc_list' in result else [])),
@@ -781,7 +857,8 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                  json.dumps(result['raw_dividend_data'] if 'raw_dividend_data' in result else {}),
                  json.dumps(result['raw_profile_data'] if 'raw_profile_data' in result else {}),
                  json.dumps(result['raw_cash_flow_data'] if 'raw_cash_flow_data' in result else []),
-                 json.dumps(result['raw_key_metrics_data'] if 'raw_key_metrics_data' in result else [])
+                 json.dumps(result['raw_key_metrics_data'] if 'raw_key_metrics_data' in result else []),
+                 result.get('exchange', 'Unknown')
                 )
             )
             conn.commit()
@@ -855,10 +932,12 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             revenue[str(cached_data['years'][-1])] = cached_data['latest_revenue']
                         # Ensure historical data lists are aligned with years (ascending order)
                         graham_score = calculate_graham_score_8(
-                            ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
+                            ticker, price, None, None, cached_data['debt_to_equity'],
                             cached_data['eps_list'], cached_data['div_list'], revenue,
-                            cached_data['balance_data'], cached_data['available_data_years'],
-                            cached_data['latest_revenue']
+                            cached_data['balance_data'], cached_data['key_metrics_data'],  # Added
+                            cached_data['available_data_years'],
+                            cached_data['latest_revenue'],
+                            cached_data['sector']  # Added
                         )
                         result = {
                             "ticker": ticker,
@@ -897,120 +976,125 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             "historic_pe_ratios": cached_data['historic_pe_ratios'],
                             "latest_net_income": cached_data['latest_net_income'],
                             "eps_cagr": cached_data.get('eps_cagr', 0.0),
-                            "free_cash_flow": cached_data.get('latest_free_cash_flow', 0.0)
+                            "free_cash_flow": cached_data.get('latest_free_cash_flow', 0.0),
                         }
                         return result
                 else:
                     if cached_data and not cached_data.get('years'):
                         analyze_logger.warning(f"Cache for {ticker} missing 'years', refetching data")
 
-                # If cache miss or invalid, fetch from FMP (only during screening)
-                if not screening_mode:
-                    analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
-                    return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
-                
-                await asyncio.sleep(DELAY_BETWEEN_CALLS)
-                security_name = ticker_manager.get_security_name(ticker)
-                
-                # Fetch fresh data if cache miss
-                income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
-                if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
-                    missing = [name for name, data in [
-                        ("income_data", income_data),
-                        ("balance_data", balance_data),
-                        ("dividend_data", dividend_data),
-                        ("profile_data", profile_data),
-                        ("cash_flow_data", cash_flow_data),
-                        ("key_metrics_data", key_metrics_data)
-                    ] if not data]
-                    analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
-                    return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
+                    # If cache miss or invalid, fetch from FMP (only during screening)
+                    if not screening_mode:
+                        analyze_logger.error(f"No valid cached data for {ticker} during analysis. Screening required first.")
+                        return {"ticker": ticker, "exchange": ticker_exchange, "error": "No cached data available for analysis"}
+                    
+                    await asyncio.sleep(DELAY_BETWEEN_CALLS)
+                    security_name = ticker_manager.get_security_name(ticker)
+                    
+                    # Fetch fresh data if cache miss
+                    income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data = await fetch_fmp_data(ticker, FMP_API_KEYS, update_rate_limit, cancel_event)
+                    if not all([income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]):
+                        missing = [name for name, data in [
+                            ("income_data", income_data),
+                            ("balance_data", balance_data),
+                            ("dividend_data", dividend_data),
+                            ("profile_data", profile_data),
+                            ("cash_flow_data", cash_flow_data),
+                            ("key_metrics_data", key_metrics_data)
+                        ] if not data]
+                        analyze_logger.error(f"FMP data fetch failed for {ticker}: Missing {', '.join(missing)}")
+                        return {"ticker": ticker, "exchange": ticker_exchange, "error": f"FMP data fetch failed - Missing {', '.join(missing)}"}
 
-                company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
-                sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
+                    company_name = profile_data[0].get('companyName', security_name) if profile_data else security_name
+                    sector = map_fmp_sector_to_app(profile_data[0].get('sector', 'Unknown')) if profile_data else 'Unknown'
 
-                latest_balance = balance_data[0] if balance_data else None
-                shareholder_equity = float(latest_balance['totalStockholdersEquity']) if latest_balance and 'totalStockholdersEquity' in latest_balance else None
-                long_term_debt = float(latest_balance['longTermDebt']) if latest_balance and 'longTermDebt' in latest_balance else None
-                debt_to_equity = long_term_debt / shareholder_equity if shareholder_equity and shareholder_equity != 0 and long_term_debt is not None else None
-                shares_outstanding = float(income_data[0]['weightedAverageShsOut']) if income_data and 'weightedAverageShsOut' in income_data[0] else None
-                book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding and shares_outstanding > 0 and shareholder_equity is not None else None
+                    latest_balance = balance_data[0] if balance_data else None
+                    shareholder_equity = float(latest_balance['totalStockholdersEquity']) if latest_balance and 'totalStockholdersEquity' in latest_balance else None
+                    long_term_debt = float(latest_balance['longTermDebt']) if latest_balance and 'longTermDebt' in latest_balance else None
+                    debt_to_equity = long_term_debt / shareholder_equity if shareholder_equity and shareholder_equity != 0 and long_term_debt is not None else None
+                    shares_outstanding = float(income_data[0]['weightedAverageShsOut']) if income_data and 'weightedAverageShsOut' in income_data[0] else None
+                    book_value_per_share = shareholder_equity / shares_outstanding if shares_outstanding and shares_outstanding > 0 and shareholder_equity is not None else None
 
-                roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list, free_cash_flow = await fetch_historical_data(
-                    ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data, cash_flow_data
-                )
-                latest_net_income = float(income_data[0]['netIncome']) if income_data and 'netIncome' in income_data[0] else None
-                available_data_years = len(years_available)
-                latest_revenue = revenue.get(str(years_available[-1]) if years_available else '', 0)  # Latest year
-                eps_ttm = eps_list[-1] if eps_list else None  # Latest annual EPS
-                common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data_list, debt_to_equity, available_data_years, latest_revenue)
+                    roe_list, rotc_list, eps_list, div_list, years_available, revenue, balance_data_list, free_cash_flow = await fetch_historical_data(
+                        ticker, ticker_exchange, update_rate_limit, cancel_event, income_data, balance_data, dividend_data, cash_flow_data
+                    )
+                    latest_net_income = float(income_data[0]['netIncome']) if income_data and 'netIncome' in income_data[0] else None
+                    available_data_years = len(years_available)
+                    latest_revenue = revenue.get(str(years_available[-1]) if years_available else '', 0)  # Latest year
+                    eps_ttm = eps_list[-1] if eps_list else None  # Latest annual EPS
+                    common_score = calculate_common_criteria(ticker, eps_list, div_list, revenue, balance_data_list, debt_to_equity, available_data_years, latest_revenue)
+                    tangible_bvps = get_tangible_book_value_per_share(key_metrics_data)
+                    result = {  # Note: 'result' was not defined here; assuming it's a dict for the return
+                        'tangible_book_value_per_share': tangible_bvps,
+                        'is_financial': (sector == "Financials")
+                    }
 
-                # Calculate eps_cagr
-                if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
-                    eps_cagr = calculate_cagr(eps_list[0], eps_list[-1], len(eps_list) - 1)
-                else:
-                    eps_cagr = 0.0
+                    # Calculate eps_cagr
+                    if len(eps_list) >= 2 and eps_list[0] > 0 and eps_list[-1] > 0:
+                        eps_cagr = calculate_cagr(eps_list[0], eps_list[-1], len(eps_list) - 1)
+                    else:
+                        eps_cagr = 0.0
 
-                # Extract new data points
-                latest_total_assets = float(latest_balance['totalAssets']) if latest_balance and 'totalAssets' in latest_balance else None
-                latest_total_liabilities = float(latest_balance['totalLiabilities']) if latest_balance and 'totalLiabilities' in latest_balance else None
-                latest_shares_outstanding = shares_outstanding
-                latest_long_term_debt = long_term_debt
-                latest_short_term_debt = float(latest_balance['shortTermDebt']) if latest_balance and 'shortTermDebt' in latest_balance else None
-                latest_current_assets = float(latest_balance['totalCurrentAssets']) if latest_balance and 'totalCurrentAssets' in latest_balance else None
-                latest_current_liabilities = float(latest_balance['totalCurrentLiabilities']) if latest_balance and 'totalCurrentLiabilities' in latest_balance else None
-                latest_book_value = shareholder_equity
-                historic_pe_ratios = json.dumps([entry.get('peRatio', 0) for entry in key_metrics_data]) if key_metrics_data else '[]'
+                    # Extract new data points
+                    latest_total_assets = float(latest_balance['totalAssets']) if latest_balance and 'totalAssets' in latest_balance else None
+                    latest_total_liabilities = float(latest_balance['totalLiabilities']) if latest_balance and 'totalLiabilities' in latest_balance else None
+                    latest_shares_outstanding = shares_outstanding
+                    latest_long_term_debt = long_term_debt
+                    latest_short_term_debt = float(latest_balance['shortTermDebt']) if latest_balance and 'shortTermDebt' in latest_balance else None
+                    latest_current_assets = float(latest_balance['totalCurrentAssets']) if latest_balance and 'totalCurrentAssets' in latest_balance else None
+                    latest_current_liabilities = float(latest_balance['totalCurrentLiabilities']) if latest_balance and 'totalCurrentLiabilities' in latest_balance else None
+                    latest_book_value = shareholder_equity
+                    historic_pe_ratios = json.dumps([entry.get('peRatio', 0) for entry in key_metrics_data]) if key_metrics_data else '[]'
 
-                full_result = {
-                    "ticker": ticker,
-                    "exchange": ticker_exchange,
-                    "company_name": company_name,
-                    "roe_list": roe_list,
-                    "rotc_list": rotc_list,
-                    "eps_list": eps_list,
-                    "div_list": div_list,
-                    "years": years_available,
-                    "balance_data": balance_data_list,
-                    "cash_flow_data": cash_flow_data,
-                    "key_metrics_data": key_metrics_data,
-                    "available_data_years": available_data_years,
-                    "latest_revenue": latest_revenue,
-                    "debt_to_equity": debt_to_equity,
-                    "eps_ttm": eps_ttm,
-                    "book_value_per_share": book_value_per_share,
-                    "timestamp": time.time(),
-                    "common_score": common_score,
-                    "sector": sector,
-                    "latest_total_assets": latest_total_assets,
-                    "latest_total_liabilities": latest_total_liabilities,
-                    "latest_shares_outstanding": latest_shares_outstanding,
-                    "latest_long_term_debt": long_term_debt,
-                    "latest_short_term_debt": latest_short_term_debt,
-                    "latest_current_assets": latest_current_assets,
-                    "latest_current_liabilities": latest_current_liabilities,
-                    "latest_book_value": latest_book_value,
-                    "historic_pe_ratios": historic_pe_ratios,
-                    "latest_net_income": latest_net_income,
-                    "eps_cagr": eps_cagr,
-                    "free_cash_flow": free_cash_flow,
-                    "raw_income_data": income_data,
-                    "raw_balance_data": balance_data,
-                    "raw_dividend_data": dividend_data,
-                    "raw_profile_data": profile_data,
-                    "raw_cash_flow_data": cash_flow_data,
-                    "raw_key_metrics_data": key_metrics_data
-                }
+                    full_result = {
+                        "ticker": ticker,
+                        "exchange": ticker_exchange,
+                        "company_name": company_name,
+                        "roe_list": roe_list,
+                        "rotc_list": rotc_list,
+                        "eps_list": eps_list,
+                        "div_list": div_list,
+                        "years": years_available,
+                        "balance_data": balance_data_list,
+                        "cash_flow_data": cash_flow_data,
+                        "key_metrics_data": key_metrics_data,
+                        "available_data_years": available_data_years,
+                        "latest_revenue": latest_revenue,
+                        "debt_to_equity": debt_to_equity,
+                        "eps_ttm": eps_ttm,
+                        "book_value_per_share": book_value_per_share,
+                        "timestamp": time.time(),
+                        "common_score": common_score,
+                        "sector": sector,
+                        "latest_total_assets": latest_total_assets,
+                        "latest_total_liabilities": latest_total_liabilities,
+                        "latest_shares_outstanding": latest_shares_outstanding,
+                        "latest_long_term_debt": long_term_debt,
+                        "latest_short_term_debt": latest_short_term_debt,
+                        "latest_current_assets": latest_current_assets,
+                        "latest_current_liabilities": latest_current_liabilities,
+                        "latest_book_value": latest_book_value,
+                        "historic_pe_ratios": historic_pe_ratios,
+                        "latest_net_income": latest_net_income,
+                        "eps_cagr": eps_cagr,
+                        "free_cash_flow": free_cash_flow,
+                        "raw_income_data": income_data,
+                        "raw_balance_data": balance_data,
+                        "raw_dividend_data": dividend_data,
+                        "raw_profile_data": profile_data,
+                        "raw_cash_flow_data": cash_flow_data,
+                        "raw_key_metrics_data": key_metrics_data
+                    }
 
-                save_to_db(full_result)
-                return {
-                    "ticker": ticker,
-                    "exchange": ticker_exchange,
-                    "company_name": company_name,
-                    "common_score": common_score,
-                    "available_data_years": available_data_years,
-                    "sector": sector
-                }
+                    save_to_db(full_result)
+                    return {
+                        "ticker": ticker,
+                        "exchange": ticker_exchange,
+                        "company_name": company_name,
+                        "common_score": common_score,
+                        "available_data_years": available_data_years,
+                        "sector": sector
+                    }
         except Exception as e:
             analyze_logger.error(f"Error processing {ticker}: {str(e)}")
             return {"ticker": ticker, "exchange": exchange, "error": f"Processing failed: {str(e)}"}
@@ -1134,6 +1218,7 @@ def get_stock_data_from_db(ticker):
                 "latest_net_income": stock_dict.get('latest_net_income'),
                 "eps_cagr": stock_dict.get('eps_cagr', 0.0),
                 "latest_free_cash_flow": stock_dict.get('latest_free_cash_flow'),
+                "exchange": stock_dict.get('exchange', 'Unknown'),
             }
             analyze_logger.debug(f"Retrieved from DB for {ticker}: Years={years}, Dividend={div_list}, EPS={eps_list}, FCF={stock_dict.get('latest_free_cash_flow', 0.0)}")
             return result
@@ -1144,9 +1229,10 @@ def get_stock_data_from_db(ticker):
     finally:
         conn.close()
 
-async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None, min_criteria: int = 6, sector_filter: Optional[str] = None) -> Tuple[List[str], List[int], List[str], List[str]]:
-    """Screen stocks for given exchange with configurable minimum criteria threshold and sector filter."""
-    screening_logger.info(f"Starting {exchange} Graham screening with min_criteria={min_criteria}, sector_filter={sector_filter or 'All'}, {len(tickers) if tickers else 'all'} tickers")
+async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, cancel_event=None, tickers=None, root=None, update_progress_animated=None, refresh_favorites_dropdown=None, ticker_manager=None, update_rate_limit=None, min_criteria: int = 6, sector_filter: Optional[str] = None, separate_financials: bool = False) -> Tuple[List[str], List[int], List[str], List[str], List[str]]:
+    """Screen stocks for given exchange with configurable minimum criteria threshold and sector filter.
+    If separate_financials is True, only screen financial stocks and return them separately."""
+    screening_logger.info(f"Starting {exchange} Graham screening with min_criteria={min_criteria}, sector_filter={sector_filter or 'All'}, separate_financials={separate_financials}, {len(tickers) if tickers else 'all'} tickers")
     if ticker_manager is None:
         ticker_manager = TickerManager(NYSE_LIST_FILE, NASDAQ_LIST_FILE)
         await ticker_manager.initialize()
@@ -1161,7 +1247,7 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
         if stored_hash != current_file_hash:
             screening_logger.info(f"New version of {file_path} detected. Resetting data.")
             cursor.execute("DELETE FROM screening_progress WHERE exchange=?", (exchange,))
-            cursor.execute("DELETE FROM stocks WHERE ticker_list_hash != ?", (current_file_hash,))
+            cursor.execute("DELETE FROM stocks WHERE exchange=? AND ticker_list_hash != ?", (exchange, current_file_hash))
             cursor.execute("DELETE FROM graham_qualifiers WHERE exchange=?", (exchange,))
             conn.commit()
 
@@ -1184,10 +1270,15 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
         processed_tickers = 0
         passed_tickers = 0
         error_tickers = []
+        financial_qualifying_stocks = []
+        non_financial_qualifying_stocks = []
 
         sample_interval = max(10, total_tickers // 50)
 
         dynamic_batch_size = min(batch_size, max(10, MAX_CALLS_PER_MINUTE_PAID // 6))  # 6 calls/ticker now
+
+        total_start_time = time.time()  # New: Track overall start time for running average
+
         for i in range(0, len(valid_tickers), dynamic_batch_size):
             if cancel_event and cancel_event.is_set():
                 screening_logger.info("Screening cancelled by user")
@@ -1208,11 +1299,19 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
                 common_score = result.get('common_score')
                 available_data_years = result.get('available_data_years', 0)
                 sector = result.get('sector', 'Unknown')  # New: Check sector
+                if separate_financials and sector != "Financials":  # Skip non-financials if flag is True
+                    if log_full:
+                        screening_logger.info(f"{ticker}: Skipped - Not financial (sector: {sector})")
+                    continue
                 if sector_filter and sector != sector_filter:
                     if log_full:
                         screening_logger.info(f"{ticker}: Skipped - Sector {sector} != {sector_filter}")
                     continue
                 if available_data_years >= 10 and common_score is not None and common_score >= min_criteria:
+                    if result['sector'] == "Financials":
+                        financial_qualifying_stocks.append(ticker)
+                    else:
+                        non_financial_qualifying_stocks.append(ticker)
                     if log_full:
                         screening_logger.info(f"{ticker}: Qualified with {common_score}/{min_criteria} criteria met (sector: {sector})")
                     qualifying_stocks.append(ticker)
@@ -1228,13 +1327,17 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
                 
                 processed_tickers += 1
                 progress = (processed_tickers / total_tickers) * 100
+                
+                # New: Calculate running average time per ticker and ETA based on total remaining
+                elapsed_total = time.time() - total_start_time
+                avg_time_per_ticker = elapsed_total / processed_tickers if processed_tickers > 0 else 0
+                remaining_tickers = total_tickers - processed_tickers
+                eta = remaining_tickers * avg_time_per_ticker
+                
                 if root and update_progress_animated:
-                    batch_time = time.time() - batch_start
-                    remaining_batches = (len(valid_tickers) - i) / dynamic_batch_size
-                    eta = remaining_batches * batch_time
                     root.after(0, lambda p=progress, t=valid_tickers, pt=passed_tickers, e=eta: update_progress_animated(p, t, pt, e))
                 cursor.execute("INSERT OR REPLACE INTO screening_progress (exchange, ticker, timestamp, file_hash, status) VALUES (?, ?, ?, ?, ?)",
-                               (exchange, ticker, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_file_hash, "completed"))
+                            (exchange, ticker, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_file_hash, "completed"))
                 conn.commit()
             screening_logger.info(f"Batch {i // dynamic_batch_size + 1} took {time.time() - batch_start:.2f} seconds")
 
@@ -1260,7 +1363,7 @@ async def screen_exchange_graham_stocks(exchange: str, batch_size: int = 18, can
             error_sample = random.sample(error_tickers, sample_size)
             screening_logger.info(f"Error tickers (random sample): {error_sample} (and {len(error_tickers) - sample_size} more)")
 
-        return qualifying_stocks, common_scores, exchanges, error_tickers
+        return qualifying_stocks, common_scores, exchanges, error_tickers, financial_qualifying_stocks  # Updated return
     finally:
         conn.close()
 
