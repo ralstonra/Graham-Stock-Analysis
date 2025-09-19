@@ -7,3 +7,5 @@ GrahamStockAnalysis.spec
 __pycache__/
 build/
 dist/
+.env
+*.db".env" 
