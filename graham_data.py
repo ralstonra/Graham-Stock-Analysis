@@ -14,6 +14,7 @@ import hashlib
 import concurrent.futures
 import requests
 import random
+from decouple import config
 from ftplib import FTP
 from config import (
     FMP_API_KEYS, FRED_API_KEY, paid_rate_limiter, free_rate_limiter, CACHE_DB, 

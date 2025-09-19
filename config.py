@@ -6,6 +6,7 @@ import time
 import threading
 import hashlib
 import logging.handlers
+from decouple import config
 
 # Base directory (remains on OneDrive, where scripts are located)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))

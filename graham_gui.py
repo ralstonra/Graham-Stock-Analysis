@@ -10,6 +10,7 @@ import time
 import os
 import json
 import yfinance as yf
+from decouple import config
 from datetime import datetime, timedelta
 from graham_data import (screen_exchange_graham_stocks, fetch_batch_data,
                          fetch_stock_data, get_stocks_connection, fetch_with_multiple_keys_async,
