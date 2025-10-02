@@ -27,10 +27,9 @@ from config import (
 from graham_utils import paid_rate_limiter, free_rate_limiter
 
 # Constants for batch processing and concurrency control
-MAX_CONCURRENT_TICKERS = 10
-MAX_TICKERS_PER_MINUTE = 250
-DELAY_BETWEEN_CALLS = 0.1
-BATCH_SIZE = 50
+MAX_CONCURRENT_TICKERS = 20
+DELAY_BETWEEN_CALLS = 0.05
+BATCH_SIZE = 125
 
 # Hardcoded known NYSE ADRs (foreign companies listed as ADRs)
 KNOWN_NYSE_ADRS = {
@@ -591,19 +590,31 @@ async def fetch_fmp_data(ticker: str, keys: List[str], update_rate_limit=None, c
     
     api_keys = keys if USE_FREE_API_KEY else [keys[0]]
     graham_logger.debug(f"Fetching data for {ticker} using {'all keys' if USE_FREE_API_KEY else 'paid key only'}")
-    income_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "income-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
-    balance_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
-    dividend_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
-    profile_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "profile", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
-    cash_flow_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "cash-flow-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
-    key_metrics_data = await asyncio.wait_for(fetch_with_multiple_keys_async(ticker, "key-metrics", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event), timeout=30)
     
-    data_list = [income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]
-    critical_endpoints = ["income", "balance", "cash_flow", "key_metrics"]
-    missing_critical = [name for i, name in enumerate(critical_endpoints) if data_list[i] is None or data_list[i] == [] or data_list[i] == {}]
-    if missing_critical:
-        graham_logger.error(f"Critical data missing for {ticker}: {', '.join(missing_critical)}. Aborting fetch.")
+    # Define fetch tasks in parallel
+    fetch_tasks = [
+        fetch_with_multiple_keys_async(ticker, "income-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event),
+        fetch_with_multiple_keys_async(ticker, "balance-sheet-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event),
+        fetch_with_multiple_keys_async(ticker, "historical-price-full/stock_dividend", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event),
+        fetch_with_multiple_keys_async(ticker, "profile", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event),
+        fetch_with_multiple_keys_async(ticker, "cash-flow-statement", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event),
+        fetch_with_multiple_keys_async(ticker, "key-metrics", api_keys, retries=3, update_rate_limit=update_rate_limit, cancel_event=cancel_event)
+    ]
+    
+    # Gather with timeout and handle exceptions
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*fetch_tasks, return_exceptions=True), timeout=30 * 6)  # 30s per call, but parallel
+    except asyncio.TimeoutError:
+        graham_logger.error(f"Timeout fetching data for {ticker}")
         return None, None, None, None, None, None
+    
+    # Unpack and check for exceptions
+    income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data = results
+    data_list = [income_data, balance_data, dividend_data, profile_data, cash_flow_data, key_metrics_data]
+    for i, (name, data) in enumerate(zip(["income", "balance", "dividend", "profile", "cash", "key-metrics"], results)):
+        if isinstance(data, Exception):
+            graham_logger.error(f"Exception in {name} fetch for {ticker}: {str(data)}")
+            return None, None, None, None, None, None  # Fail fast on any error
     
     empty_endpoints = [name for name, d in zip(["income", "balance", "dividend", "profile", "cash_flow", "key_metrics"], data_list) if d == [] or d == {}]
     if empty_endpoints:

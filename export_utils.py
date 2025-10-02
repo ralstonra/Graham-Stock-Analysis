@@ -26,16 +26,29 @@ def format_float(value, precision=2):
     return f"{value:.{precision}f}"
 
 def fetch_current_prices(tickers):
-    """Fetch current prices for a list of tickers using yfinance."""
+    """Fetch current prices for a list of tickers using yfinance with fallback."""
     try:
         data = yf.download(tickers, period="1d", progress=False)['Close']
+        if data.empty:
+            raise ValueError("No data for 1d period")
         if len(tickers) == 1:
-            return {tickers[0]: data.iloc[-1] if not data.empty else "N/A"}
+            return {tickers[0]: data.iloc[-1]}
         else:
             return {k: v if not pd.isna(v) else "N/A" for k, v in data.iloc[-1].to_dict().items()}
     except Exception as e:
-        graham_logger.error(f"Error fetching prices: {str(e)}")
-        return {ticker: "N/A" for ticker in tickers}
+        graham_logger.warning(f"1d fetch failed for {tickers}: {str(e)}, trying 5d fallback")
+        try:
+            data = yf.download(tickers, period="5d", progress=False)['Close']
+            if data.empty:
+                raise ValueError("No data for 5d fallback")
+            latest_close = data.iloc[-1]  # Use most recent available
+            if len(tickers) == 1:
+                return {tickers[0]: latest_close}
+            else:
+                return {k: v if not pd.isna(v) else "N/A" for k, v in latest_close.to_dict().items()}
+        except Exception as fallback_e:
+            graham_logger.error(f"5d fallback failed: {str(fallback_e)}")
+            return {ticker: "N/A" for ticker in tickers}
 
 def calculate_intrinsic_value(stock_dict):
     eps = stock_dict.get('eps_ttm')
@@ -187,8 +200,9 @@ def create_summary_sheet(wb, sheet_name, stocks, is_financial=False, factor=0.0)
         ticker_sheet_name = stock['ticker'][:31]  # Unquoted name
         quoted_ticker_sheet_name = quote_sheetname(ticker_sheet_name)  # Quoted if needed
         company_cell = sheet.cell(row=row_idx, column=1, value=stock.get("company_name", "Unknown"))
-        company_cell.hyperlink = f"#'{quoted_ticker_sheet_name}'!A1"
+        company_cell.hyperlink = f"# '{ticker_sheet_name}'!A1"  # Force single quotes
         company_cell.style = "Hyperlink"
+        company_cell.font = Font(color="0000FF", underline="single", name="Calibri", size=11)
         
         sheet.cell(row=row_idx, column=2, value=stock.get("ticker", "N/A"))
         sheet.cell(row=row_idx, column=3, value=stock.get("sector", "Unknown"))
@@ -304,6 +318,7 @@ def create_summary_sheet(wb, sheet_name, stocks, is_financial=False, factor=0.0)
     sheet.auto_filter.ref = f"A1:{last_col_letter}{last_row}"
     sheet.auto_filter.add_sort_condition(f"A2:A{last_row}")
     graham_logger.info(f"Created '{sheet_name}' sheet with {len(stocks)} stocks")
+    return sheet
 
 def create_stock_sheet(wb, row, prices, factor, exchange):
     """Create an individual stock sheet with data and charts."""
@@ -311,7 +326,7 @@ def create_stock_sheet(wb, row, prices, factor, exchange):
     price = prices.get(ticker, "N/A")
     if price == "N/A" or not isinstance(price, (int, float)):
         graham_logger.warning(f"Skipping {ticker} due to invalid price")
-        return
+        return None  # Explicit None if skipped
 
     stock_sheet = wb.create_sheet(ticker[:31])
 
@@ -999,12 +1014,14 @@ def create_stock_sheet(wb, row, prices, factor, exchange):
         chart2.width = 15
         chart2.height = 8
 
+    return stock_sheet
+
 def export_qualifying_stocks(exchange, min_criteria, margin_of_safety, expected_return):
     conn, cursor = cache_manager.get_stocks_connection()
     try:
         cursor.execute("""
             SELECT s.ticker, s.company_name, g.common_score, s.date, s.roe, s.rotc, s.eps, s.dividend,
-                s.ticker_list_hash, s.balance_data, s.timestamp, s.debt_to_equity, s.eps_ttm,
+                s.ticker_list_hash, s.raw_balance_data, s.timestamp, s.debt_to_equity, s.eps_ttm,
                 s.book_value_per_share, s.latest_revenue, s.available_data_years, s.sector,
                 s.years, s.latest_total_assets, s.latest_total_liabilities, s.latest_shares_outstanding,
                 s.latest_long_term_debt, s.latest_short_term_debt, s.latest_current_assets,
@@ -1078,24 +1095,43 @@ def export_qualifying_stocks(exchange, min_criteria, margin_of_safety, expected_
 
         financial_sectors_lower = ['financial services', 'finance', 'banking', 'financials']
         financial_stocks = [stock for stock in stock_data_list if stock['sector'].lower() in financial_sectors_lower]
-        other_stocks = [stock for stock in stock_data_list if stock not in financial_stocks]
+        other_stocks = [stock for stock in stock_data_list if stock['sector'].lower() not in financial_sectors_lower]
 
         factor_val = 1 - (margin_of_safety / 100)
 
-        if other_stocks:
-            create_summary_sheet(wb, "Winning Stocks", other_stocks, is_financial=False, factor=factor_val)
-
-        if financial_stocks:
-            create_summary_sheet(wb, "Financial Winners", financial_stocks, is_financial=True, factor=factor_val)
-
+        # Create individual stock sheets FIRST (for hyperlink resolution), sorted by ticker
         results.sort(key=lambda x: x[0])
+        individual_sheets = {}  # Track for order
         for row in results:
-            create_stock_sheet(wb, row, prices, factor_val, exchange)
+            sheet = create_stock_sheet(wb, row, prices, factor_val, exchange)
+            if sheet:
+                individual_sheets[row[0][:31]] = sheet  # Key by sheet name
+
+        # Create summaries AFTER individuals
+        winning_sheet = None
+        financial_sheet = None
+        if other_stocks:
+            winning_sheet = create_summary_sheet(wb, "Winning Stocks", other_stocks, is_financial=False, factor=factor_val)
+        if financial_stocks:
+            financial_sheet = create_summary_sheet(wb, "Financial Winners", financial_stocks, is_financial=True, factor=factor_val)
+
+        # REORDER: Explicitly set workbook sheet order
+        desired_order = ["Start Here"]
+        if winning_sheet:
+            desired_order.append(winning_sheet.title)
+        if financial_sheet:
+            desired_order.append(financial_sheet.title)
+        # Append individuals alphabetically by ticker/sheet name
+        individual_titles = sorted(individual_sheets.keys())
+        desired_order.extend(individual_titles)
+        new_sheets = [wb[sheet_title] for sheet_title in desired_order if sheet_title in wb.sheetnames]
+        wb._sheets = new_sheets
+        graham_logger.info(f"Workbook sheet order after explicit reordering: {[s.title for s in wb.worksheets]}")
 
         file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], initialfile=f"{exchange}_Qualifying_Stocks.xlsx")
         if file_path:
             wb.save(file_path)
-            messagebox.showinfo("Export Successful", f"Qualifying stocks exported to {file_path}")
+            messagebox.showinfo("Export Successful", f"Qualifying stocks exported to {file_path}. Note: Save and reopen the file in Excel to ensure all hyperlinks activate fully (common with generated files).")
             graham_logger.info(f"Exported {exchange} qualifying stocks to {file_path}")
     except Exception as e:
         graham_logger.error(f"Error exporting {exchange} qualifying stocks: {str(e)}")
