@@ -14,6 +14,7 @@ import hashlib
 import concurrent.futures
 import requests
 import random
+import math
 from decouple import config
 from bs4 import BeautifulSoup
 from ftplib import FTP
@@ -858,18 +859,25 @@ def get_bank_metrics(key_metrics_data: list) -> dict:
     return {'roa': roa, 'roe': roe, 'netInterestMargin': nim}
 
 async def calculate_graham_value(earnings: Optional[float], stock_data: dict) -> float:
+    ticker = stock_data.get('ticker', 'Unknown')
     if not earnings or earnings <= 0:
+        graham_logger.debug(f"calculate_graham_value: Skipping intrinsic value for {ticker} due to invalid earnings {earnings}")
         return float('nan')
     aaa_yield = cache_manager.get_aaa_yield(FRED_API_KEY)
     if aaa_yield <= 0:
+        graham_logger.warning(f"calculate_graham_value: Invalid AAA yield {aaa_yield} for {ticker}")
         return float('nan')
     eps_cagr = stock_data.get('eps_cagr', 0.0)
+    if not isinstance(eps_cagr, (int, float)) or math.isinf(eps_cagr) or math.isnan(eps_cagr):
+        graham_logger.warning(f"calculate_graham_value: Invalid EPS CAGR {eps_cagr} for {ticker}, using 0")
+        eps_cagr = 0.0
     g = max(eps_cagr * 100, 0)
     max_multiplier = 15 if stock_data.get('sector') == "Financials" else 20
     earnings_multiplier = min(8.5 + 2 * g, max_multiplier)
     normalization_factor = 4.4
     value = (earnings * earnings_multiplier * normalization_factor) / (100 * aaa_yield)
-    return value
+    graham_logger.debug(f"calculate_graham_value for {ticker}: earnings={earnings}, eps_cagr={eps_cagr}, multiplier={earnings_multiplier}, aaa_yield={aaa_yield}, value={value}")
+    return value if isinstance(value, (int, float)) and not math.isinf(value) and not pd.isna(value) else float('nan')
 
 def map_fmp_sector_to_app(fmp_sector: str) -> str:
     """Map FMP sector names to app's standard sector categories."""
@@ -917,9 +925,20 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                 ticker_list_hash = get_file_hash(NASDAQ_LIST_FILE)
             else:
                 ticker_list_hash = "Unknown"
+        
+            # Ensure all potential lists are strings
+            years_str = ",".join(map(str, result.get('years', [])))
+            historic_pe_str = json.dumps(result.get('historic_pe_ratios', []))  # Ensure str
+            raw_income_str = json.dumps(result.get('raw_income_data', []))
+            raw_balance_str = json.dumps(result.get('raw_balance_data', []))
+            raw_div_str = json.dumps(result.get('raw_dividend_data', {}))
+            raw_profile_str = json.dumps(result.get('raw_profile_data', {}))
+            raw_cash_str = json.dumps(result.get('raw_cash_flow_data', []))
+            raw_key_str = json.dumps(result.get('raw_key_metrics_data', []))
+
             cursor.execute(
                 """INSERT OR REPLACE INTO stocks 
-                   (ticker, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, 
+                (ticker, date, roe, rotc, eps, dividend, ticker_list_hash, balance_data, 
                     cash_flow_data, key_metrics_data, timestamp, company_name, debt_to_equity, 
                     eps_ttm, book_value_per_share, common_score, latest_revenue, 
                     available_data_years, sector, years,
@@ -929,41 +948,38 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                     latest_net_income, eps_cagr, latest_free_cash_flow,
                     raw_income_data, raw_balance_data, raw_dividend_data, raw_profile_data,
                     raw_cash_flow_data, raw_key_metrics_data, exchange, is_foreign) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (result['ticker'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                 ",".join(map(str, result['roe_list'] if 'roe_list' in result else [])),
-                 ",".join(map(str, result['rotc_list'] if 'rotc_list' in result else [])),
-                 ",".join(map(str, result['eps_list'] if 'eps_list' in result else [])),
-                 ",".join(map(str, result['div_list'] if 'div_list' in result else [])),
-                 ticker_list_hash, 
-                 json.dumps(result['balance_data'] if 'balance_data' in result else []),
-                 json.dumps(result['cash_flow_data'] if 'cash_flow_data' in result else []),
-                 json.dumps(result['key_metrics_data'] if 'key_metrics_data' in result else []),
-                 result['timestamp'], result['company_name'], result['debt_to_equity'],
-                 result['eps_ttm'], result['book_value_per_share'], result['common_score'],
-                 result['latest_revenue'], result['available_data_years'], result['sector'],
-                 ",".join(map(str, result['years'] if 'years' in result else [])),
-                 result['latest_total_assets'], result['latest_total_liabilities'],
-                 result['latest_shares_outstanding'], result['latest_long_term_debt'],
-                 result['latest_short_term_debt'], result['latest_current_assets'],
-                 result['latest_current_liabilities'], result['latest_book_value'],
-                 result['historic_pe_ratios'], result['latest_net_income'], result['eps_cagr'],
-                 result['free_cash_flow'],
-                 json.dumps(result['raw_income_data'] if 'raw_income_data' in result else []),
-                 json.dumps(result['raw_balance_data'] if 'raw_balance_data' in result else []),
-                 json.dumps(result['raw_dividend_data'] if 'raw_dividend_data' in result else {}),
-                 json.dumps(result['raw_profile_data'] if 'raw_profile_data' in result else {}),
-                 json.dumps(result['raw_cash_flow_data'] if 'raw_cash_flow_data' in result else []),
-                 json.dumps(result['raw_key_metrics_data'] if 'raw_key_metrics_data' in result else []),
-                 result.get('exchange', 'Unknown'),
-                 result.get('is_foreign', False)
+                ",".join(map(str, result.get('roe_list', []))),
+                ",".join(map(str, result.get('rotc_list', []))),
+                ",".join(map(str, result.get('eps_list', []))),
+                ",".join(map(str, result.get('div_list', []))),
+                ticker_list_hash, 
+                json.dumps(result.get('balance_data', [])),
+                json.dumps(result.get('cash_flow_data', [])),
+                json.dumps(result.get('key_metrics_data', [])),
+                result['timestamp'], result['company_name'], result['debt_to_equity'],
+                result['eps_ttm'], result['book_value_per_share'], result['common_score'],
+                result['latest_revenue'], result['available_data_years'], result['sector'],
+                years_str,  # Use the ensured str
+                result['latest_total_assets'], result['latest_total_liabilities'],
+                result['latest_shares_outstanding'], result['latest_long_term_debt'],
+                result['latest_short_term_debt'], result['latest_current_assets'],
+                result['latest_current_liabilities'], result['latest_book_value'],
+                historic_pe_str,  # Ensured str
+                result['latest_net_income'], result['eps_cagr'],
+                result['latest_free_cash_flow'],
+                raw_income_str, raw_balance_str, raw_div_str, raw_profile_str,
+                raw_cash_str, raw_key_str,
+                result.get('exchange', 'Unknown'),
+                result.get('is_foreign', False)
                 )
             )
             conn.commit()
             graham_logger.info(f"Saved {result['ticker']} to database with hash {ticker_list_hash}")
         except sqlite3.Error as e:
-            graham_logger.error(f"Database error saving {result['ticker']}: {str(e)}")
+            graham_logger.error(f"Database error saving {result.get('ticker', 'Unknown')}: {str(e)}")
         finally:
             conn.close()
 
@@ -993,38 +1009,52 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             "is_foreign": cached_data.get('is_foreign', False)
                         }
                     else:
-                        # Fetch price from Yahoo Finance
+                        # Fetch price from Yahoo Finance with robust error handling
                         max_retries = 3
                         delay = 1
+                        price = None
                         for attempt in range(max_retries):
                             try:
                                 stock = yf.Ticker(ticker)
                                 history = stock.history(period="1d")
-                                if not history.empty:
-                                    price = history['Close'].iloc[-1]
+                                graham_logger.debug(f"YFinance history for {ticker}: {history}")
+                                if not history.empty and 'Close' in history.columns:
+                                    price = float(history['Close'].iloc[-1])  # Ensure float
+                                    graham_logger.debug(f"Fetched price for {ticker}: {price}")
+                                    break
                                 else:
                                     raise ValueError(f"No historical price data for {ticker}")
-                                break
                             except requests.exceptions.HTTPError as e:
                                 if e.response.status_code == 429 and attempt < max_retries - 1:
                                     graham_logger.warning(f"Rate limit hit for {ticker}, retrying in {delay} seconds...")
                                     await asyncio.sleep(delay)
                                     delay *= 2
                                 else:
-                                    graham_logger.error(f"Error fetching price for {ticker}: {str(e)}")
-                                    return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                                    graham_logger.error(f"HTTP error fetching price for {ticker}: {str(e)}")
+                                    price = None
+                                    break
                             except Exception as e:
                                 graham_logger.error(f"Error fetching price for {ticker}: {str(e)}")
-                                return {"ticker": ticker, "exchange": ticker_exchange, "error": f"YFinance fetch failed: {str(e)}"}
+                                price = None
+                                break
                         else:
                             graham_logger.error(f"Failed to fetch price for {ticker} after {max_retries} attempts")
-                            return {"ticker": ticker, "exchange": ticker_exchange, "error": "Rate limit exceeded"}
-
-                        pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else None
-                        pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] and cached_data['book_value_per_share'] > 0 else None
-                        intrinsic_value = await calculate_graham_value(cached_data['eps_ttm'], cached_data) if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else float('nan')
-                        buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
-                        sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
+                            price = None
+                        # If price is None, log and set financial metrics to None
+                        if price is None or not isinstance(price, (int, float)) or math.isinf(price):
+                            graham_logger.warning(f"No valid price for {ticker}, setting financial metrics to None")
+                            pe_ratio = None
+                            pb_ratio = None
+                            intrinsic_value = float('nan')
+                            buy_price = float('nan')
+                            sell_price = float('nan')
+                        else:
+                            pe_ratio = price / cached_data['eps_ttm'] if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else None
+                            pb_ratio = price / cached_data['book_value_per_share'] if cached_data['book_value_per_share'] and cached_data['book_value_per_share'] > 0 else None
+                            intrinsic_value = await calculate_graham_value(cached_data['eps_ttm'], cached_data) if cached_data['eps_ttm'] and cached_data['eps_ttm'] > 0 else float('nan')
+                            buy_price = intrinsic_value * (1 - margin_of_safety) if not pd.isna(intrinsic_value) else float('nan')
+                            sell_price = intrinsic_value * (1 + expected_return) if not pd.isna(intrinsic_value) else float('nan')
+                        graham_logger.debug(f"For {ticker}: price={price}, eps_ttm={cached_data['eps_ttm']}, intrinsic_value={intrinsic_value}, buy_price={buy_price}, sell_price={sell_price}")
                         revenue = {str(cached_data['years'][-1]): cached_data['latest_revenue']} if cached_data['years'] and cached_data['latest_revenue'] else {}
                         graham_score = calculate_graham_score_8(
                             ticker, price, pe_ratio, pb_ratio, cached_data['debt_to_equity'],
@@ -1071,9 +1101,10 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                             "historic_pe_ratios": cached_data['historic_pe_ratios'],
                             "latest_net_income": cached_data['latest_net_income'],
                             "eps_cagr": cached_data.get('eps_cagr', 0.0),
-                            "free_cash_flow": cached_data.get('latest_free_cash_flow', 0.0),
+                            "latest_free_cash_flow": cached_data.get('latest_free_cash_flow', 0.0),
                             "is_foreign": cached_data.get('is_foreign', False)
                         }
+                        graham_logger.debug(f"Result for {ticker}: {{price: {result['price']}, intrinsic_value: {result['intrinsic_value']}, buy_price: {result['buy_price']}, sell_price: {result['sell_price']}}}")
                         save_to_db(result)
                         return result
                 else:
@@ -1173,7 +1204,7 @@ async def fetch_batch_data(tickers, screening_mode=True, expected_return=0.0, ma
                         "historic_pe_ratios": historic_pe_ratios,
                         "latest_net_income": latest_net_income,
                         "eps_cagr": eps_cagr,
-                        "free_cash_flow": free_cash_flow,
+                        "latest_free_cash_flow": free_cash_flow,
                         "raw_income_data": income_data,
                         "raw_balance_data": balance_data,
                         "raw_dividend_data": dividend_data,

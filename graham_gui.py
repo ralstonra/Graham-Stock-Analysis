@@ -643,12 +643,15 @@ class GrahamScreeningApp:
             graham_logger.error(f"Error fetching company name for {ticker}: {str(e)}")
             return 'Unknown'
 
-    def format_float(value, precision=2):
+    def format_float(self, value, precision=2):
         if isinstance(value, str):
             return value  # Already "N/A" or similar
-        if pd.isna(value) or not isinstance(value, (int, float)) or math.isinf(value):
+        if pd.isna(value) or value is None or not isinstance(value, (int, float)) or math.isinf(value):
+            graham_logger.debug(f"format_float: Returning N/A for value {value} (type: {type(value)})")
             return "N/A"
-        return f"{value:.{precision}f}"
+        formatted = f"{value:.{precision}f}"
+        graham_logger.debug(f"format_float: Formatted {value} to {formatted}")
+        return formatted
 
     async def fetch_cached_data(self, ticker, exchange="Unknown"):
         nyse_file_hash = get_file_hash(NYSE_LIST_FILE)
@@ -853,27 +856,32 @@ class GrahamScreeningApp:
             self.tree.delete(item)
         for result in valid_results:
             years_used = result.get('available_data_years', 0)
-            graham_logger.debug(f"Processing result for {result['ticker']}: Graham Score={result['graham_score']}, Years={years_used}, Is Foreign={result.get('is_foreign', False)}")
             warning = f" (based on {years_used} years)" if years_used < 10 else ""
             sector_display = result['sector']
             tags = []
             if result.get('is_foreign', False):
                 sector_display += " (Foreign)"
                 tags.append('foreign')
-            price = result['price']
-            buy_price = result['buy_price']
-            if price <= buy_price and not pd.isna(price) and not pd.isna(buy_price):
+            price = result.get('price')
+            buy_price = result.get('buy_price')
+            if price is not None and buy_price is not None and not pd.isna(price) and not pd.isna(buy_price) and price <= buy_price:
                 tags.append('highlight')
+            graham_logger.debug(f"Processing result for {result['ticker']}: Graham Score={result['graham_score']}, Years swiss={years_used}, Is Foreign={result.get('is_foreign', False)}, Price={result.get('price')}, Intrinsic={result.get('intrinsic_value')}")
+            price_str = f"${self.format_float(result.get('price'))}"
+            intrinsic_str = f"${self.format_float(result.get('intrinsic_value'))}"
+            buy_str = f"${self.format_float(result.get('buy_price'))}"
+            sell_str = f"${self.format_float(result.get('sell_price'))}"
+            graham_logger.debug(f"Treeview strings for {result['ticker']}: Price={price_str}, Intrinsic={intrinsic_str}, Buy={buy_str}, Sell={sell_str}")
             self.safe_update_tree(
                 result['ticker'],
                 (
                     result['company_name'],
                     sector_display,
                     f"{result['graham_score']}/8{warning}",
-                    f"${self.format_float(result['price'])}",
-                    f"${self.format_float(result['intrinsic_value'])}",
-                    f"${self.format_float(result['buy_price'])}",
-                    f"${self.format_float(result['sell_price'])}"
+                    price_str,
+                    intrinsic_str,
+                    buy_str,
+                    sell_str
                 ),
                 tags
             )
@@ -881,7 +889,7 @@ class GrahamScreeningApp:
                 self.ticker_cache[result['ticker']] = result
         graham_logger.info(f"Cache usage: {cache_hits} hits out of {len(analysis_tickers)} total tickers")
         self.root.after(0, lambda: self.update_cache_usage(cache_hits, len(analysis_tickers)))
-        self.root.after(0, lambda: self.self.throttled_update_progress(100, analysis_tickers, passed_tickers))
+        self.root.after(0, lambda: self.throttled_update_progress(100, analysis_tickers, passed_tickers))
         self.root.after(0, lambda: self.status_label.config(text=""))
         graham_logger.info("Analysis fully completed and UI updated")
 
